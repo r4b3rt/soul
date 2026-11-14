@@ -1,0 +1,93 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.shenyu.client.core.register.registrar;
+
+import org.apache.shenyu.client.core.disruptor.ShenyuClientRegisterEventPublisher;
+import org.apache.shenyu.client.core.register.ApiBean;
+import org.apache.shenyu.client.core.register.ClientRegisterConfig;
+import org.apache.shenyu.client.core.utils.ApiBeanUtil;
+import org.apache.shenyu.register.common.dto.URIRegisterDTO;
+import org.apache.shenyu.register.common.enums.EventType;
+
+/**
+ * UriApiRegistrarImplImpl.
+ *
+ * <p>Like the full-mode branches of the client event listeners, URI publication must
+ * only happen in local discovery mode. This registrar is not wired by any starter yet;
+ * when it becomes reachable, gate {@link #doRegisterApi} / {@link #doRegisterBean} on
+ * the discovery mode (see
+ * {@code AbstractContextRefreshedEventListener#isDiscoveryLocalMode}) to avoid dual
+ * upstream registration for the same selector.
+ *
+ * @see URIRegisterDTO
+ */
+public class UriApiRegistrarImplImpl extends BaseApiRegistrarImpl {
+    
+    private final ShenyuClientRegisterEventPublisher publisher = ShenyuClientRegisterEventPublisher.getInstance();
+    
+    private final ClientRegisterConfig clientRegisterConfig;
+    
+    public UriApiRegistrarImplImpl(final ClientRegisterConfig clientRegisterConfig) {
+        this.clientRegisterConfig = clientRegisterConfig;
+    }
+    
+    @Override
+    protected void doRegisterApi(final ApiBean.ApiDefinition api) {
+        clientRegisterConfig.getNamespace().forEach(namespaceId -> registerApi(api, namespaceId));
+    }
+
+    private void registerApi(final ApiBean.ApiDefinition api, final String namespaceId) {
+        final URIRegisterDTO uriRegisterDTO = URIRegisterDTO.builder()
+                .namespaceId(namespaceId)
+                .contextPath(clientRegisterConfig.getContextPath())
+                .appName(clientRegisterConfig.getAppName())
+                .eventType(EventType.REGISTER)
+                .host(clientRegisterConfig.getHost())
+                .port(clientRegisterConfig.getPort())
+                .rpcType(getRpcType(api))
+                .build();
+        publisher.publishEvent(uriRegisterDTO);
+    }
+    
+    @Override
+    protected void doRegisterBean(final ApiBean apiBean) {
+        clientRegisterConfig.getNamespace().forEach(namespaceId -> registerBean(apiBean, namespaceId));
+    }
+
+    private void registerBean(final ApiBean apiBean, final String namespaceId) {
+        final URIRegisterDTO uriRegisterDTO = URIRegisterDTO.builder()
+                .namespaceId(namespaceId)
+                .contextPath(clientRegisterConfig.getContextPath())
+                .appName(clientRegisterConfig.getAppName())
+                .eventType(EventType.REGISTER)
+                .host(clientRegisterConfig.getHost())
+                .port(clientRegisterConfig.getPort())
+                .rpcType(getRpcType(apiBean))
+                .build();
+        publisher.publishEvent(uriRegisterDTO);
+    }
+    
+    private static String getRpcType(final ApiBean.ApiDefinition api) {
+        return ApiBeanUtil.getRpcType(api);
+    }
+    
+    private static String getRpcType(final ApiBean api) {
+        return ApiBeanUtil.getRpcType(api);
+    }
+    
+}

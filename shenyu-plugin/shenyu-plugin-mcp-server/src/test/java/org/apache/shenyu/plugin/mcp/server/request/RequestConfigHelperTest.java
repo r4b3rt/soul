@@ -1,0 +1,307 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.shenyu.plugin.mcp.server.request;
+
+import com.google.gson.JsonObject;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+/**
+ * Test case for {@link RequestConfigHelper}.
+ */
+class RequestConfigHelperTest {
+
+    @Test
+    void testBasicGetRequest() {
+        String configStr = "{\"requestTemplate\":{\"url\":\"/test\",\"method\":\"GET\",\"argsPosition\":{}}}";
+        RequestConfigHelper helper = new RequestConfigHelper(configStr);
+        
+        assertEquals("/test", helper.getUrlTemplate());
+        assertEquals("GET", helper.getMethod());
+        assertFalse(helper.isArgsToJsonBody());
+        assertNotNull(helper.getRequestTemplate());
+        assertNotNull(helper.getArgsPosition());
+    }
+
+    @Test
+    void testPostRequestWithJsonBody() {
+        String configStr = "{\"requestTemplate\":{\"url\":\"/api/users\","
+                + "\"method\":\"POST\",\"headers\":[{\"key\":\"Content-Type\","
+                + "\"value\":\"application/json\"}],\"argsToJsonBody\":true},\"argsPosition\":{\"name\":\"body\",\"email\":\"body\"}}";
+        RequestConfigHelper helper = new RequestConfigHelper(configStr);
+        
+        assertEquals("/api/users", helper.getUrlTemplate());
+        assertEquals("POST", helper.getMethod());
+        assertTrue(helper.isArgsToJsonBody());
+        
+        JsonObject requestTemplate = helper.getRequestTemplate();
+        assertTrue(requestTemplate.has("headers"));
+        
+        JsonObject argsPosition = helper.getArgsPosition();
+        assertEquals("body", argsPosition.get("name").getAsString());
+        assertEquals("body", argsPosition.get("email").getAsString());
+    }
+
+    @Test
+    void testArgsPositionCompatibilityWithNestedFormat() {
+        String configStr = "{\"requestTemplate\":{\"url\":\"/api/users\","
+                + "\"method\":\"POST\",\"argsPosition\":{\"name\":\"body\",\"email\":\"body\"}}}";
+        RequestConfigHelper helper = new RequestConfigHelper(configStr);
+
+        JsonObject argsPosition = helper.getArgsPosition();
+        assertEquals("body", argsPosition.get("name").getAsString());
+        assertEquals("body", argsPosition.get("email").getAsString());
+    }
+
+    @Test
+    void testPathParameterBuilding() {
+        JsonObject argsPosition = new JsonObject();
+        argsPosition.addProperty("id", "path");
+        
+        JsonObject inputJson = new JsonObject();
+        inputJson.addProperty("id", "123");
+        
+        String result = RequestConfigHelper.buildPath("/users/{{.id}}", argsPosition, inputJson);
+        assertEquals("/users/123", result);
+    }
+
+    @Test
+    void testQueryParameterBuilding() {
+        JsonObject argsPosition = new JsonObject();
+        argsPosition.addProperty("page", "query");
+        argsPosition.addProperty("size", "query");
+        
+        JsonObject inputJson = new JsonObject();
+        inputJson.addProperty("page", "1");
+        inputJson.addProperty("size", "10");
+        
+        String result = RequestConfigHelper.buildPath("/users", argsPosition, inputJson);
+        assertTrue(result.contains("page=1"));
+        assertTrue(result.contains("size=10"));
+        assertTrue(result.contains("?"));
+        assertTrue(result.contains("&"));
+    }
+
+    @ParameterizedTest
+    @CsvSource({
+        "/users?fixed=true, /users?page=1&fixed=true",
+        "/users?page=10, /users?page=10",
+        "/users?homepage=10&note=page=10, /users?page=1&homepage=10&note=page=10"
+    })
+    void testQueryParameterMerging(final String template, final String expected) {
+        JsonObject argsPosition = new JsonObject();
+        argsPosition.addProperty("page", "query");
+        JsonObject inputJson = new JsonObject();
+        inputJson.addProperty("page", "1");
+
+        String result = RequestConfigHelper.buildPath(template, argsPosition, inputJson);
+
+        assertEquals(expected, result);
+    }
+
+    @Test
+    void testQueryMergingPreservesEncoding() {
+        JsonObject argsPosition = new JsonObject();
+        argsPosition.addProperty("query", "query");
+        JsonObject inputJson = new JsonObject();
+        inputJson.addProperty("query", "hello world & 50%");
+
+        String result = RequestConfigHelper.buildPath("/users?fixed=a%26b%3Dc%20d", argsPosition, inputJson);
+
+        assertEquals("/users?query=hello%20world%20%26%2050%25&fixed=a%26b%3Dc%20d", result);
+    }
+
+    @Test
+    void testMixedPathAndQueryParameters() {
+        JsonObject argsPosition = new JsonObject();
+        argsPosition.addProperty("userId", "path");
+        argsPosition.addProperty("include", "query");
+        
+        JsonObject inputJson = new JsonObject();
+        inputJson.addProperty("userId", "456");
+        inputJson.addProperty("include", "profile");
+        
+        String result = RequestConfigHelper.buildPath("/users/{{.userId}}/details", argsPosition, inputJson);
+        assertTrue(result.startsWith("/users/456/details"));
+        assertTrue(result.contains("include=profile"));
+    }
+
+    @Test
+    void testInvalidJsonConfig() {
+        assertThrows(Exception.class, () -> {
+            new RequestConfigHelper("invalid json");
+        });
+    }
+
+    @Test
+    void testMissingRequestTemplate() {
+        RequestConfigHelper helper = new RequestConfigHelper("{\"argsPosition\":{}}");
+        IllegalArgumentException urlException = assertThrows(IllegalArgumentException.class, helper::getUrlTemplate);
+        assertEquals("requestTemplate is required", urlException.getMessage());
+
+        IllegalArgumentException methodException = assertThrows(IllegalArgumentException.class, helper::getMethod);
+        assertEquals("requestTemplate is required", methodException.getMessage());
+
+        IllegalArgumentException argsToJsonBodyException = assertThrows(IllegalArgumentException.class, helper::isArgsToJsonBody);
+        assertEquals("requestTemplate is required", argsToJsonBodyException.getMessage());
+    }
+
+    @Test
+    void testMissingUrlInTemplate() {
+        RequestConfigHelper helper = new RequestConfigHelper("{\"requestTemplate\":{\"method\":\"GET\"}}");
+        IllegalArgumentException exception = assertThrows(IllegalArgumentException.class, helper::getUrlTemplate);
+        assertEquals("url is required in requestTemplate", exception.getMessage());
+    }
+
+    @Test
+    void testMissingMethodInTemplate() {
+        RequestConfigHelper helper = new RequestConfigHelper("{\"requestTemplate\":{\"url\":\"/test\"}}");
+        // getMethod() has a default value "GET", so it won't throw exception
+        // Instead test that default method is returned
+        assertEquals("GET", helper.getMethod());
+    }
+
+    @Test
+    void testDefaultArgsToJsonBody() {
+        String configStr = "{\"requestTemplate\":{\"url\":\"/test\",\"method\":\"GET\"},\"argsPosition\":{}}";
+        RequestConfigHelper helper = new RequestConfigHelper(configStr);
+        
+        assertFalse(helper.isArgsToJsonBody());
+    }
+
+    @Test
+    void testResponseTemplateExtraction() {
+        String configStr = "{\"requestTemplate\":{\"url\":\"/test\",\"method\":\"GET\"},\"argsPosition\":{},\"responseTemplate\":{\"body\":\"{{.}}\"}}";
+        RequestConfigHelper helper = new RequestConfigHelper(configStr);
+        
+        JsonObject responseTemplate = helper.getResponseTemplate();
+        assertNotNull(responseTemplate);
+        assertTrue(responseTemplate.has("body"));
+        assertEquals("{{.}}", responseTemplate.get("body").getAsString());
+    }
+
+    @Test
+    void testComplexPathTemplate() {
+        JsonObject argsPosition = new JsonObject();
+        argsPosition.addProperty("orgId", "path");
+        argsPosition.addProperty("projectId", "path");
+        argsPosition.addProperty("version", "query");
+        
+        JsonObject inputJson = new JsonObject();
+        inputJson.addProperty("orgId", "apache");
+        inputJson.addProperty("projectId", "shenyu");
+        inputJson.addProperty("version", "2.7.0");
+        
+        String result = RequestConfigHelper.buildPath("/orgs/{{.orgId}}/projects/{{.projectId}}", argsPosition, inputJson);
+        assertTrue(result.startsWith("/orgs/apache/projects/shenyu"));
+        assertTrue(result.contains("version=2.7.0"));
+    }
+
+    @Test
+    void testEmptyPathTemplate() {
+        JsonObject argsPosition = new JsonObject();
+        JsonObject inputJson = new JsonObject();
+        
+        String result = RequestConfigHelper.buildPath("/simple/path", argsPosition, inputJson);
+        assertEquals("/simple/path", result);
+    }
+
+    @Test
+    void testSpecialCharactersInParameters() {
+        JsonObject argsPosition = new JsonObject();
+        argsPosition.addProperty("query", "query");
+        
+        JsonObject inputJson = new JsonObject();
+        inputJson.addProperty("query", "hello world & special chars");
+        
+        String result = RequestConfigHelper.buildPath("/search", argsPosition, inputJson);
+        assertEquals("/search?query=hello%20world%20%26%20special%20chars", result);
+    }
+
+    @Test
+    void testReservedCharactersInPathParameter() {
+        JsonObject argsPosition = new JsonObject();
+        argsPosition.addProperty("id", "path");
+        JsonObject inputJson = new JsonObject();
+        inputJson.addProperty("id", "a/b #?+%");
+
+        String result = RequestConfigHelper.buildPath("/items/{{.id}}", argsPosition, inputJson);
+
+        assertEquals("/items/a%2Fb%20%23%3F+%25", result);
+    }
+
+    @Test
+    void testUrlValuedDataDoesNotReplaceFixedEndpoint() {
+        for (String position : new String[]{"query", "body", "body.callback", "header", "path"}) {
+            JsonObject argsPosition = new JsonObject();
+            argsPosition.addProperty("callbackUrl", position);
+            JsonObject inputJson = new JsonObject();
+            inputJson.addProperty("callbackUrl", "https://callback.invalid/return");
+
+            String path = RequestConfigHelper.buildPath("/search", argsPosition, inputJson);
+
+            if ("query".equals(position)) {
+                assertTrue(path.startsWith("/search?callbackUrl="), position);
+                assertTrue(path.contains("callback.invalid"), position);
+            } else {
+                assertEquals("/search", path, position);
+            }
+        }
+    }
+
+    @Test
+    void testExplicitTargetArgumentCanSelectFullUrl() {
+        JsonObject argsPosition = new JsonObject();
+        argsPosition.addProperty("endpoint", "target");
+        JsonObject inputJson = new JsonObject();
+        inputJson.addProperty("endpoint", "https://target.example/api");
+
+        assertEquals("https://target.example/api",
+                RequestConfigHelper.buildPath("/search", argsPosition, inputJson));
+    }
+
+    @Test
+    void testUnmappedUrlValueDoesNotChangeEndpoint() {
+        JsonObject argsPosition = new JsonObject();
+        JsonObject inputJson = new JsonObject();
+        inputJson.addProperty("endpoint", "https://target.example/api");
+
+        assertEquals("/search", RequestConfigHelper.buildPath("/search", argsPosition, inputJson));
+    }
+
+    @Test
+    void testExplicitTargetStillAppliesMappedQuery() {
+        JsonObject positions = new JsonObject();
+        positions.addProperty("endpoint", "target");
+        positions.addProperty("page", "query");
+        JsonObject input = new JsonObject();
+        input.addProperty("endpoint", "https://target.example/api?fixed=1");
+        input.addProperty("page", "2");
+
+        assertEquals("https://target.example/api?page=2&fixed=1",
+                RequestConfigHelper.buildPath("/search", positions, input));
+    }
+
+}

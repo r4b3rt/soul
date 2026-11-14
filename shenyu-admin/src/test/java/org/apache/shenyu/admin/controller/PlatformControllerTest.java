@@ -1,0 +1,165 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.shenyu.admin.controller;
+
+import org.apache.shenyu.admin.model.vo.DashboardUserVO;
+import org.apache.shenyu.admin.model.vo.LoginDashboardUserVO;
+import org.apache.shenyu.admin.service.DashboardUserService;
+import org.apache.shenyu.admin.service.EnumService;
+import org.apache.shenyu.admin.service.SecretService;
+import org.apache.shenyu.admin.utils.ShenyuResultMessage;
+import org.apache.shenyu.common.exception.CommonErrorCode;
+import org.apache.shenyu.common.utils.DateUtils;
+import org.apache.shenyu.admin.exception.ExceptionHandlers;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.InjectMocks;
+import org.mockito.Mock;
+import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.http.HttpMethod;
+import org.springframework.http.MediaType;
+import org.springframework.test.web.servlet.MockMvc;
+import org.springframework.test.web.servlet.request.MockMvcRequestBuilders;
+import org.springframework.test.web.servlet.setup.MockMvcBuilders;
+import org.springframework.validation.beanvalidation.LocalValidatorFactoryBean;
+
+import java.time.LocalDateTime;
+
+import static org.hamcrest.core.Is.is;
+import static org.hamcrest.core.IsNot.not;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.isNull;
+import static org.mockito.BDDMockito.given;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
+
+
+/**
+ * test case for PlatformController.
+ */
+@ExtendWith(MockitoExtension.class)
+public final class PlatformControllerTest {
+
+    private static final String TEST_LOGIN_USER_NAME = "admin";
+
+    private static final String TEST_LOGIN_PASSWORD = "123456";
+
+    private static final String TEST_USER_ID = "1";
+
+    private static final String TEST_STORED_PASSWORD = "2095132720951327";
+
+    private MockMvc mockMvc;
+
+    @InjectMocks
+    private PlatformController platformController;
+
+    @Mock
+    private DashboardUserService dashboardUserService;
+
+    @Mock
+    private EnumService enumService;
+
+    @Mock
+    private SecretService secretService;
+
+    /**
+     * dashboardUser mock data.
+     */
+    private final DashboardUserVO dashboardUserVO = new DashboardUserVO(TEST_USER_ID, TEST_LOGIN_USER_NAME, TEST_STORED_PASSWORD,
+            1, true, TEST_USER_ID, DateUtils.localDateTimeToString(LocalDateTime.now()),
+            DateUtils.localDateTimeToString(LocalDateTime.now()));
+
+    /**
+     * init mockmvc.
+     */
+    @BeforeEach
+    public void setUp() {
+        // wire up a validator so @Valid on the POST body is actually enforced,
+        // and the controller advice so MethodArgumentNotValidException is handled.
+        this.mockMvc = MockMvcBuilders.standaloneSetup(platformController)
+                .setValidator(new LocalValidatorFactoryBean())
+                .setControllerAdvice(new ExceptionHandlers(null))
+                .build();
+    }
+
+    /**
+     * test method loginDashboardUser.
+     */
+    @Test
+    public void testLoginDashboardUser() throws Exception {
+        final String loginUri = "/platform/login";
+        final String loginRequestBody = String.format("{\"userName\":\"%s\",\"password\":\"%s\"}", TEST_LOGIN_USER_NAME, TEST_LOGIN_PASSWORD);
+
+        LoginDashboardUserVO loginDashboardUserVO = LoginDashboardUserVO.buildLoginDashboardUserVO(dashboardUserVO);
+        given(this.dashboardUserService.login(eq(TEST_LOGIN_USER_NAME), eq(TEST_LOGIN_PASSWORD), isNull())).willReturn(loginDashboardUserVO);
+        this.mockMvc.perform(MockMvcRequestBuilders.post(loginUri)
+                .contentType(MediaType.APPLICATION_JSON)
+                .content(loginRequestBody))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.code", is(CommonErrorCode.SUCCESSFUL)))
+                .andExpect(jsonPath("$.message", is(ShenyuResultMessage.PLATFORM_LOGIN_SUCCESS)))
+                .andExpect(jsonPath("$.data.id", is(loginDashboardUserVO.getId())))
+                .andReturn();
+    }
+
+    /**
+     * test method loginDashboardUser rejects an invalid POST body (@Valid fail-closed).
+     */
+    @Test
+    public void testLoginDashboardUserWithInvalidBody() throws Exception {
+        final String loginUri = "/platform/login";
+
+        // blank userName/password must be rejected without hitting the service
+        this.mockMvc.perform(MockMvcRequestBuilders.post(loginUri)
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("{}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.code", not(CommonErrorCode.SUCCESSFUL)))
+                .andReturn();
+    }
+
+    /**
+     * test method queryEnums.
+     */
+    @Test
+    public void testQueryEnums() throws Exception {
+        final String queryEnumsUri = "/platform/enum";
+
+        this.mockMvc.perform(MockMvcRequestBuilders.request(HttpMethod.GET, queryEnumsUri))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.code", is(CommonErrorCode.SUCCESSFUL)))
+                .andExpect(jsonPath("$.data", is(this.enumService.list())))
+                .andReturn();
+    }
+
+    /**
+     * test method QuerySecretInfo.
+     */
+    @Test
+    public void testQuerySecretInfo() throws Exception {
+        final String querySecretInfoUri = "/platform/secretInfo";
+
+        this.mockMvc.perform(MockMvcRequestBuilders.request(HttpMethod.GET, querySecretInfoUri))
+            .andExpect(status().isOk())
+            .andExpect(jsonPath("$.code", is(CommonErrorCode.SUCCESSFUL)))
+            .andExpect(jsonPath("$.data", is(secretService.info())))
+            .andReturn();
+    }
+
+}

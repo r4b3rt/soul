@@ -1,0 +1,445 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.shenyu.admin.listener;
+
+import jakarta.annotation.Resource;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+import java.util.function.Function;
+import org.apache.commons.codec.digest.DigestUtils;
+import org.apache.commons.collections4.CollectionUtils;
+import org.apache.commons.lang3.StringUtils;
+import org.apache.shenyu.admin.listener.http.HttpLongPollingDataChangedListener;
+import org.apache.shenyu.admin.model.vo.NamespaceVO;
+import org.apache.shenyu.admin.service.AppAuthService;
+import org.apache.shenyu.admin.service.DiscoveryUpstreamService;
+import org.apache.shenyu.admin.service.MetaDataService;
+import org.apache.shenyu.admin.service.NamespacePluginService;
+import org.apache.shenyu.admin.service.NamespaceService;
+import org.apache.shenyu.admin.service.ProxySelectorService;
+import org.apache.shenyu.admin.service.AiProxyApiKeyService;
+import org.apache.shenyu.admin.service.RuleService;
+import org.apache.shenyu.admin.service.SelectorService;
+import org.apache.shenyu.common.dto.AppAuthData;
+import org.apache.shenyu.common.dto.ConfigData;
+import org.apache.shenyu.common.dto.DiscoverySyncData;
+import org.apache.shenyu.common.dto.MetaData;
+import org.apache.shenyu.common.dto.PluginData;
+import org.apache.shenyu.common.dto.ProxyApiKeyData;
+import org.apache.shenyu.common.dto.ProxySelectorData;
+import org.apache.shenyu.common.dto.RuleData;
+import org.apache.shenyu.common.dto.SelectorData;
+import org.apache.shenyu.common.enums.ConfigGroupEnum;
+import org.apache.shenyu.common.enums.DataEventTypeEnum;
+import org.apache.shenyu.common.enums.PluginEnum;
+import org.apache.shenyu.common.utils.GsonUtils;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.InitializingBean;
+
+import static org.apache.shenyu.common.constant.Constants.SYS_DEFAULT_NAMESPACE_ID;
+
+
+/**
+ * Abstract class for ConfigEventListener.
+ * As we think that the md5 value of the in-memory data is the same as the md5 value of the database,
+ * although it may be a little different, but it doesn't matter, we will have thread to periodically
+ * pull the data in the database.
+ *
+ * @since 2.0.0
+ */
+public abstract class AbstractDataChangedListener implements DataChangedListener, InitializingBean {
+
+    /**
+     * The constant CACHE.
+     */
+    protected static final ConcurrentMap<String, ConfigDataCache> CACHE = new ConcurrentHashMap<>();
+
+    private static final Logger LOG = LoggerFactory.getLogger(AbstractDataChangedListener.class);
+
+    @Resource
+    private AppAuthService appAuthService;
+
+    /**
+     * The Plugin service.
+     */
+    @Resource
+    private NamespacePluginService namespacePluginService;
+
+    /**
+     * The Rule service.
+     */
+    @Resource
+    private RuleService ruleService;
+
+    /**
+     * The Selector service.
+     */
+    @Resource
+    private SelectorService selectorService;
+
+    /**
+     * The MetaData service.
+     */
+    @Resource
+    private MetaDataService metaDataService;
+
+    @Resource
+    private ProxySelectorService proxySelectorService;
+
+    @Resource
+    private DiscoveryUpstreamService discoveryUpstreamService;
+
+    @Resource
+    private NamespaceService namespaceService;
+
+    @Resource
+    private AiProxyApiKeyService aiProxyApiKeyService;
+
+    /**
+     * fetch configuration from cache.
+     *
+     * @param groupKey    the group key
+     * @param namespaceId the namespaceId
+     * @return the configuration data
+     */
+    public ConfigData<?> fetchConfig(final ConfigGroupEnum groupKey, final String namespaceId) {
+        ConfigDataCache config = CACHE.get(HttpLongPollingDataChangedListener.buildCacheKey(namespaceId, groupKey.name()));
+        switch (groupKey) {
+            case APP_AUTH:
+                return buildConfigData(config, AppAuthData.class);
+            case PLUGIN:
+                return buildConfigData(config, PluginData.class);
+            case RULE:
+                return buildConfigData(config, RuleData.class);
+            case SELECTOR:
+                return buildConfigData(config, SelectorData.class);
+            case META_DATA:
+                return buildConfigData(config, MetaData.class);
+            case PROXY_SELECTOR:
+                return buildConfigData(config, ProxySelectorData.class);
+            case DISCOVER_UPSTREAM:
+                return buildConfigData(config, DiscoverySyncData.class);
+            case AI_PROXY_API_KEY:
+                return buildConfigData(config, ProxyApiKeyData.class);
+            default:
+                throw new IllegalStateException("Unexpected groupKey: " + groupKey);
+        }
+    }
+
+    @Override
+    public void onAppAuthChanged(final List<AppAuthData> changed, final DataEventTypeEnum eventType) {
+        if (CollectionUtils.isEmpty(changed)) {
+            return;
+        }
+        groupByNamespace(changed, AppAuthData::getNamespaceId, ConfigGroupEnum.APP_AUTH).forEach((namespaceId, namespaceChanged) -> {
+            this.refreshCache(ConfigGroupEnum.APP_AUTH, namespaceId, () -> this.updateAppAuthCache(namespaceId));
+            this.afterAppAuthChanged(namespaceChanged, eventType, namespaceId);
+        });
+    }
+
+    /**
+     * After app auth changed.
+     *
+     * @param changed   the changed
+     * @param eventType the event type
+     */
+    protected void afterAppAuthChanged(final List<AppAuthData> changed, final DataEventTypeEnum eventType, final String namespaceId) {
+    }
+
+    @Override
+    public void onMetaDataChanged(final List<MetaData> changed, final DataEventTypeEnum eventType) {
+        if (CollectionUtils.isEmpty(changed)) {
+            return;
+        }
+        groupByNamespace(changed, MetaData::getNamespaceId, ConfigGroupEnum.META_DATA).forEach((namespaceId, namespaceChanged) -> {
+            this.refreshCache(ConfigGroupEnum.META_DATA, namespaceId, () -> this.updateMetaDataCache(namespaceId));
+            this.afterMetaDataChanged(namespaceChanged, eventType, namespaceId);
+        });
+    }
+
+    /**
+     * After meta data changed.
+     *
+     * @param changed   the changed
+     * @param eventType the event type
+     */
+    protected void afterMetaDataChanged(final List<MetaData> changed, final DataEventTypeEnum eventType, final String namespaceId) {
+    }
+
+    @Override
+    public void onPluginChanged(final List<PluginData> changed, final DataEventTypeEnum eventType) {
+        if (CollectionUtils.isEmpty(changed)) {
+            return;
+        }
+        groupByNamespace(changed, PluginData::getNamespaceId, ConfigGroupEnum.PLUGIN).forEach((namespaceId, namespaceChanged) -> {
+            this.refreshCache(ConfigGroupEnum.PLUGIN, namespaceId, () -> this.updatePluginCache(namespaceId));
+            this.afterPluginChanged(namespaceChanged, eventType, namespaceId);
+        });
+    }
+
+    /**
+     * After plugin changed.
+     *
+     * @param changed   the changed
+     * @param eventType the event type
+     */
+    protected void afterPluginChanged(final List<PluginData> changed, final DataEventTypeEnum eventType, final String namespaceId) {
+        // When AI Proxy plugin is synchronized, also refresh proxy apikey cache so it is included in the same sync cycle
+        if (CollectionUtils.isEmpty(changed)) {
+            return;
+        }
+        boolean containsAiProxy = changed.stream()
+                .filter(Objects::nonNull)
+                .anyMatch(p -> StringUtils.equalsIgnoreCase(p.getName(), PluginEnum.AI_PROXY.getName()));
+        if (containsAiProxy) {
+            this.updateAiProxyApiKeyCache(namespaceId);
+        }
+    }
+
+    @Override
+    public void onRuleChanged(final List<RuleData> changed, final DataEventTypeEnum eventType) {
+        if (CollectionUtils.isEmpty(changed)) {
+            return;
+        }
+        groupByNamespace(changed, RuleData::getNamespaceId, ConfigGroupEnum.RULE).forEach((namespaceId, namespaceChanged) -> {
+            this.refreshCache(ConfigGroupEnum.RULE, namespaceId, () -> this.updateRuleCache(namespaceId));
+            this.afterRuleChanged(namespaceChanged, eventType, namespaceId);
+        });
+    }
+
+    /**
+     * After rule changed.
+     *
+     * @param changed   the changed
+     * @param eventType the event type
+     */
+    protected void afterRuleChanged(final List<RuleData> changed, final DataEventTypeEnum eventType, final String namespaceId) {
+    }
+
+    @Override
+    public void onSelectorChanged(final List<SelectorData> changed, final DataEventTypeEnum eventType) {
+        if (CollectionUtils.isEmpty(changed)) {
+            return;
+        }
+        groupByNamespace(changed, SelectorData::getNamespaceId, ConfigGroupEnum.SELECTOR).forEach((namespaceId, namespaceChanged) -> {
+            this.refreshCache(ConfigGroupEnum.SELECTOR, namespaceId, () -> this.updateSelectorCache(namespaceId));
+            this.afterSelectorChanged(namespaceChanged, eventType, namespaceId);
+        });
+    }
+
+    /**
+     * invoke this method when ProxySelector was changed.
+     *
+     * @param changed   the changed
+     * @param eventType the event type
+     */
+    @Override
+    public void onProxySelectorChanged(final List<ProxySelectorData> changed, final DataEventTypeEnum eventType) {
+        if (CollectionUtils.isEmpty(changed)) {
+            return;
+        }
+        groupByNamespace(changed, ProxySelectorData::getNamespaceId, ConfigGroupEnum.PROXY_SELECTOR).forEach((namespaceId, namespaceChanged) -> {
+            this.refreshCache(ConfigGroupEnum.PROXY_SELECTOR, namespaceId, () -> this.updateProxySelectorDataCache(namespaceId));
+            this.afterProxySelectorChanged(namespaceChanged, eventType, namespaceId);
+        });
+    }
+
+    /**
+     * After proxySelector changed.
+     *
+     * @param changed   the changed
+     * @param eventType the event type
+     */
+    protected void afterProxySelectorChanged(final List<ProxySelectorData> changed, final DataEventTypeEnum eventType, final String namespaceId) {
+    }
+
+    /**
+     * invoke this method when DiscoveryUpstream was changed.
+     *
+     * @param changed   the changed
+     * @param eventType the event type
+     */
+    @Override
+    public void onDiscoveryUpstreamChanged(final List<DiscoverySyncData> changed, final DataEventTypeEnum eventType) {
+        if (CollectionUtils.isEmpty(changed)) {
+            return;
+        }
+        groupByNamespace(changed, DiscoverySyncData::getNamespaceId, ConfigGroupEnum.DISCOVER_UPSTREAM).forEach((namespaceId, namespaceChanged) -> {
+            this.refreshCache(ConfigGroupEnum.DISCOVER_UPSTREAM, namespaceId, () -> this.updateDiscoveryUpstreamDataCache(namespaceId));
+            this.afterDiscoveryUpstreamDataChanged(namespaceChanged, eventType, namespaceId);
+        });
+    }
+
+    private <T> Map<String, List<T>> groupByNamespace(final List<T> changed, final Function<T, String> namespaceIdGetter, final ConfigGroupEnum group) {
+        Map<String, List<T>> changedByNamespace = new LinkedHashMap<>();
+        for (T data : changed) {
+            if (Objects.isNull(data)) {
+                LOG.warn("skip null {} change while grouping namespaces", group);
+                continue;
+            }
+            String namespaceId = StringUtils.defaultString(namespaceIdGetter.apply(data), SYS_DEFAULT_NAMESPACE_ID);
+            changedByNamespace.computeIfAbsent(namespaceId, key -> new ArrayList<>()).add(data);
+        }
+        return changedByNamespace;
+    }
+
+    /**
+     * After DiscoveryUpstreamData changed.
+     *
+     * @param changed   the changed
+     * @param eventType the event type
+     */
+    protected void afterDiscoveryUpstreamDataChanged(final List<DiscoverySyncData> changed, final DataEventTypeEnum eventType, final String namespaceId) {
+    }
+
+    /**
+     * After selector changed.
+     *
+     * @param changed   the changed
+     * @param eventType the event type
+     */
+    protected void afterSelectorChanged(final List<SelectorData> changed, final DataEventTypeEnum eventType, final String namespaceId) {
+    }
+
+    @Override
+    public final void afterPropertiesSet() {
+        this.refreshLocalCache();
+        this.afterInitialize();
+    }
+
+    protected abstract void afterInitialize();
+
+    /**
+     * Refresh a group for a committed change. Transport implementations may coalesce snapshot work;
+     * event callbacks are still invoked once for every event and namespace.
+     *
+     * @param group configuration group
+     * @param namespaceId namespace id
+     * @param rebuild authoritative cache rebuild, without event payloads
+     */
+    protected void refreshCache(final ConfigGroupEnum group, final String namespaceId, final Runnable rebuild) {
+        rebuild.run();
+    }
+
+    /**
+     * if md5 is not the same as the original, then update local cache.
+     *
+     * @param group ConfigGroupEnum
+     * @param <T>   the type of class
+     * @param data  the new config data
+     */
+    protected <T> void updateCache(final ConfigGroupEnum group, final List<T> data, final String namespaceId) {
+        String json = GsonUtils.getInstance().toJson(data);
+        String newMd5 = DigestUtils.md5Hex(json);
+        ConfigDataCache oldConfig = CACHE.get(HttpLongPollingDataChangedListener.buildCacheKey(namespaceId, group.name()));
+        if (Objects.nonNull(oldConfig) && StringUtils.isNotBlank(oldConfig.getMd5())) {
+            if (oldConfig.getMd5().equals(newMd5)) {
+                LOG.info("config cache[{}] is not changed, skip update.", group);
+                return;
+            }
+        }
+        String configDataCacheKey = HttpLongPollingDataChangedListener.buildCacheKey(namespaceId, group.name());
+        ConfigDataCache newVal = new ConfigDataCache(configDataCacheKey, json, newMd5, System.currentTimeMillis(), namespaceId);
+        ConfigDataCache oldVal = CACHE.put(newVal.getGroup(), newVal);
+        LOG.info("update config cache[{}], old: {}, updated: {}", group, oldVal, newVal);
+    }
+
+    /**
+     * refresh local cache.
+     */
+    protected void refreshLocalCache() {
+        List<NamespaceVO> namespaceList = namespaceService.listAll();
+        for (NamespaceVO namespace : namespaceList) {
+            this.refreshLocalCache(namespace.getNamespaceId());
+        }
+    }
+
+    /**
+     * Refresh local cache for one namespace.
+     *
+     * @param namespaceId namespace id
+     */
+    protected void refreshLocalCache(final String namespaceId) {
+        this.updatePluginCache(namespaceId);
+        this.updateAppAuthCache(namespaceId);
+        this.updateRuleCache(namespaceId);
+        this.updateSelectorCache(namespaceId);
+        this.updateMetaDataCache(namespaceId);
+        this.updateProxySelectorDataCache(namespaceId);
+        this.updateDiscoveryUpstreamDataCache(namespaceId);
+        this.updateAiProxyApiKeyCache(namespaceId);
+    }
+
+    /**
+     * Update selector cache.
+     */
+    protected void updateSelectorCache(final String namespaceId) {
+        this.updateCache(ConfigGroupEnum.SELECTOR, selectorService.listAllByNamespaceId(namespaceId), namespaceId);
+    }
+
+    /**
+     * Update rule cache.
+     */
+    protected void updateRuleCache(final String namespaceId) {
+        this.updateCache(ConfigGroupEnum.RULE, ruleService.listAllByNamespaceId(namespaceId), namespaceId);
+    }
+
+    /**
+     * Update plugin cache.
+     */
+    protected void updatePluginCache(final String namespaceId) {
+        this.updateCache(ConfigGroupEnum.PLUGIN, namespacePluginService.listAll(namespaceId), namespaceId);
+    }
+
+    /**
+     * Update app auth cache.
+     */
+    protected void updateAppAuthCache(final String namespaceId) {
+        this.updateCache(ConfigGroupEnum.APP_AUTH, appAuthService.listAllByNamespaceId(namespaceId), namespaceId);
+    }
+
+    /**
+     * Update meta data cache.
+     */
+    protected void updateMetaDataCache(final String namespaceId) {
+        this.updateCache(ConfigGroupEnum.META_DATA, metaDataService.listAllByNamespaceId(namespaceId), namespaceId);
+    }
+
+    protected void updateProxySelectorDataCache(final String namespaceId) {
+        this.updateCache(ConfigGroupEnum.PROXY_SELECTOR, proxySelectorService.listAllByNamespaceId(namespaceId), namespaceId);
+    }
+
+    protected void updateDiscoveryUpstreamDataCache(final String namespaceId) {
+        this.updateCache(ConfigGroupEnum.DISCOVER_UPSTREAM, discoveryUpstreamService.listAllByNamespaceId(namespaceId), namespaceId);
+    }
+
+    protected void updateAiProxyApiKeyCache(final String namespaceId) {
+        this.updateCache(ConfigGroupEnum.AI_PROXY_API_KEY, aiProxyApiKeyService.listAllByNamespaceId(namespaceId), namespaceId);
+    }
+
+    private <T> ConfigData<T> buildConfigData(final ConfigDataCache config, final Class<T> dataType) {
+        return new ConfigData<>(config.getMd5(), config.getLastModifyTime(), GsonUtils.getInstance().fromList(config.getJson(), dataType));
+    }
+
+}

@@ -1,0 +1,729 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.shenyu.admin.listener.http;
+
+import com.google.common.collect.Lists;
+import org.apache.commons.collections4.CollectionUtils;
+import org.apache.commons.lang3.StringUtils;
+import org.apache.shenyu.admin.config.properties.HttpSyncProperties;
+import org.apache.shenyu.admin.listener.AbstractDataChangedListener;
+import org.apache.shenyu.admin.listener.ConfigDataCache;
+import org.apache.shenyu.admin.model.event.instance.InstanceInfoReportEvent;
+import org.apache.shenyu.admin.model.result.ShenyuAdminResult;
+import org.apache.shenyu.admin.service.publish.InstanceInfoReportEventPublisher;
+import org.apache.shenyu.admin.spring.SpringBeanUtils;
+import org.apache.shenyu.admin.utils.ShenyuResultMessage;
+import org.apache.shenyu.common.concurrent.ShenyuThreadFactory;
+import org.apache.shenyu.common.constant.HttpConstants;
+import org.apache.shenyu.common.constant.InstanceTypeConstants;
+import org.apache.shenyu.common.dto.AppAuthData;
+import org.apache.shenyu.common.dto.DiscoverySyncData;
+import org.apache.shenyu.common.dto.MetaData;
+import org.apache.shenyu.common.dto.PluginData;
+import org.apache.shenyu.common.dto.ProxySelectorData;
+import org.apache.shenyu.common.dto.RuleData;
+import org.apache.shenyu.common.dto.SelectorData;
+import org.apache.shenyu.common.enums.ConfigGroupEnum;
+import org.apache.shenyu.common.enums.DataEventTypeEnum;
+import org.apache.shenyu.common.exception.ShenyuException;
+import org.apache.shenyu.common.utils.GsonUtils;
+import org.apache.commons.lang3.math.NumberUtils;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.DisposableBean;
+import org.springframework.http.MediaType;
+
+import jakarta.annotation.PreDestroy;
+import jakarta.servlet.AsyncContext;
+import jakarta.servlet.AsyncEvent;
+import jakarta.servlet.AsyncListener;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
+
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+import static org.apache.shenyu.common.constant.Constants.SYS_DEFAULT_NAMESPACE_ID;
+
+/**
+ * HTTP long polling, which blocks the client's request thread
+ * and informs the client of group information about data changes
+ * when there are data changes. If there is no data change after the specified time,
+ * the client will make a listening request again.
+ *
+ * @since 2.0.0
+ */
+@SuppressWarnings("all")
+public class HttpLongPollingDataChangedListener extends AbstractDataChangedListener implements DisposableBean {
+
+    private static final long DEFAULT_HEARTBEAT_INTERVAL_MS = 10000L;
+
+    private static final Logger LOG = LoggerFactory.getLogger(HttpLongPollingDataChangedListener.class);
+
+    private static final String X_REAL_IP = "X-Real-IP";
+
+    private static final String X_FORWARDED_FOR = "X-Forwarded-For";
+
+    private static final String X_FORWARDED_FOR_SPLIT_SYMBOL = ",";
+
+    private static final String X_REAL_PORT = "X-Real-PORT";
+
+    private static final String CLIENT_PORT_ZERO = "0";
+
+    /**
+     * Blocked client.
+     */
+    private final Map<String, BlockingQueue<LongPollingClient>> clientsMap;
+
+    private final Map<String, Object> refreshLocks;
+
+    private final ScheduledExecutorService scheduler;
+
+    private final ScheduledExecutorService livenessScheduler;
+
+    private final HttpCacheRebuildCoordinator cacheRebuildCoordinator;
+
+    private long heartbeatIntervalMs;
+
+    private final HttpSyncProperties httpSyncProperties;
+
+    /**
+     * Instantiates a new Http long polling data changed listener.
+     *
+     * @param httpSyncProperties the HttpSyncProperties
+     */
+    public HttpLongPollingDataChangedListener(final HttpSyncProperties httpSyncProperties) {
+        this(httpSyncProperties, null, null);
+    }
+
+    /**
+     * Instantiates a new Http long polling data changed listener with custom schedulers.
+     *
+     * @param httpSyncProperties the HttpSyncProperties
+     * @param scheduler           the scheduler
+     * @param livenessScheduler   the liveness scheduler
+     */
+    HttpLongPollingDataChangedListener(final HttpSyncProperties httpSyncProperties,
+                                       final ScheduledExecutorService scheduler,
+                                       final ScheduledExecutorService livenessScheduler) {
+        this.clientsMap = new ConcurrentHashMap<>();
+        this.refreshLocks = new ConcurrentHashMap<>();
+        if (Objects.nonNull(scheduler)) {
+            this.scheduler = scheduler;
+        } else {
+            ScheduledThreadPoolExecutor poolExecutor = new ScheduledThreadPoolExecutor(1,
+                    ShenyuThreadFactory.create("long-polling", true));
+            poolExecutor.setRemoveOnCancelPolicy(true);
+            this.scheduler = poolExecutor;
+        }
+        if (Objects.nonNull(livenessScheduler)) {
+            this.livenessScheduler = livenessScheduler;
+        } else {
+            ScheduledThreadPoolExecutor livenessPoolExecutor = new ScheduledThreadPoolExecutor(1,
+                    ShenyuThreadFactory.create("shenyu-http-long-polling-liveness-", true));
+            livenessPoolExecutor.setRemoveOnCancelPolicy(true);
+            this.livenessScheduler = livenessPoolExecutor;
+        }
+        this.httpSyncProperties = httpSyncProperties;
+        this.cacheRebuildCoordinator = Objects.nonNull(httpSyncProperties) && Objects.nonNull(httpSyncProperties.getCacheRebuildWindow())
+                && !httpSyncProperties.getCacheRebuildWindow().isZero()
+                ? new HttpCacheRebuildCoordinator(new ScheduledThreadPoolExecutor(httpSyncProperties.getCacheRebuildThreads(),
+                        ShenyuThreadFactory.create("http-cache-rebuild", true)),
+                        httpSyncProperties.getCacheRebuildWindow().toMillis(), httpSyncProperties.getCacheRebuildMaxPendingKeys()) : null;
+        this.heartbeatIntervalMs = Objects.nonNull(httpSyncProperties) && httpSyncProperties.getHeartbeatInterval() > 0
+                ? httpSyncProperties.getHeartbeatInterval() : DEFAULT_HEARTBEAT_INTERVAL_MS;
+    }
+
+    @Override
+    protected void refreshCache(final ConfigGroupEnum group, final String namespaceId, final Runnable rebuild) {
+        if (Objects.isNull(cacheRebuildCoordinator)) {
+            super.refreshCache(group, namespaceId, rebuild);
+            return;
+        }
+        Runnable work = () -> {
+            synchronized (refreshLocks.computeIfAbsent(namespaceId, key -> new Object())) {
+                rebuild.run();
+            }
+            // The coalescing path owns its notification: wake long-poll clients only after publication.
+            try {
+                scheduler.execute(new DataChangeTask(group, namespaceId));
+            } catch (RejectedExecutionException ex) {
+                if (!scheduler.isShutdown()) {
+                    throw ex;
+                }
+                LOG.debug("skip long-polling notification for {} {}: listener is shutting down", namespaceId, group, ex);
+            }
+        };
+        if (!cacheRebuildCoordinator.request(buildCacheKey(namespaceId, group.name()), work)) {
+            // Bounded memory under overload: new keys apply backpressure to their committing caller.
+            work.run();
+        }
+    }
+
+    @Override
+    protected void refreshLocalCache(final String namespaceId) {
+        synchronized (refreshLocks.computeIfAbsent(namespaceId, key -> new Object())) {
+            super.refreshLocalCache(namespaceId);
+        }
+    }
+
+    private void notifyChanged(final ConfigGroupEnum group, final String namespaceId) {
+        // Intentionally a no-op when coalescing is enabled: the coalesced rebuild in refreshCache issues
+        // the DataChangeTask after it publishes the new snapshot, so notifying here would wake clients
+        // before the cache they compare against has changed.
+        if (Objects.isNull(cacheRebuildCoordinator)) {
+            scheduler.execute(new DataChangeTask(group, namespaceId));
+        }
+    }
+
+    @Override
+    @PreDestroy
+    public void destroy() {
+        if (Objects.nonNull(cacheRebuildCoordinator)) {
+            cacheRebuildCoordinator.close();
+        }
+        if (Objects.nonNull(this.scheduler)) {
+            this.scheduler.shutdown();
+        }
+        if (Objects.nonNull(this.livenessScheduler)) {
+            this.livenessScheduler.shutdown();
+        }
+    }
+
+    /**
+     * Gets the heartbeat interval in milliseconds.
+     *
+     * @return the heartbeat interval in milliseconds
+     */
+    public long getHeartbeatIntervalMs() {
+        return heartbeatIntervalMs;
+    }
+
+    @Override
+    protected void afterInitialize() {
+        long syncInterval = httpSyncProperties.getRefreshInterval().toMillis();
+        // Periodically check the data for changes and update the cache
+        scheduler.scheduleWithFixedDelay(() -> {
+            LOG.info("http sync strategy refresh config start.");
+            try {
+                super.refreshLocalCache();
+                LOG.info("http sync strategy refresh config success.");
+            } catch (Exception e) {
+                LOG.error("http sync strategy refresh config error!", e);
+            }
+        }, syncInterval, syncInterval, TimeUnit.MILLISECONDS);
+        LOG.info("http sync strategy refresh interval: {}ms", syncInterval);
+    }
+
+    Map<String, BlockingQueue<LongPollingClient>> getClientsMap() {
+        return clientsMap;
+    }
+
+    /**
+     * If the configuration data changes, the group information for the change is immediately responded.
+     * Otherwise, the client's request thread is blocked until any data changes or the specified timeout is reached.
+     *
+     * @param request  the request
+     * @param response the response
+     */
+    public void doLongPolling(final HttpServletRequest request, final HttpServletResponse response) {
+        // compare group md5
+        List<ConfigGroupEnum> changedGroup = compareChangedGroup(request);
+        final String clientIp = getRemoteIp(request);
+        final String namespaceId = getNamespaceId(request);
+        // The header already contains JSON text; encoding it again adds a string wrapper.
+        final String bootstrapInfo = StringUtils.defaultString(request.getHeader(InstanceTypeConstants.BOOTSTRAP_INSTANCE_INFO), "");
+        final String clientPort = StringUtils.defaultString(request.getHeader(X_REAL_PORT), StringUtils.EMPTY);
+        reportInstanceInfo(clientIp, clientPort, bootstrapInfo, namespaceId);
+        // response immediately.
+        if (CollectionUtils.isNotEmpty(changedGroup)) {
+            this.generateResponse(response, changedGroup);
+            LOG.info("send response with the changed group, ip={}, group={}", clientIp, changedGroup);
+            return;
+        }
+        LOG.debug("no changed group, ip={}, waiting for compare cache changed", clientIp);
+        // listen for configuration changed.
+        final AsyncContext asyncContext = request.startAsync();
+        // AsyncContext.settimeout() does not timeout properly, so you have to control it yourself
+        asyncContext.setTimeout(0L);
+        // block client's thread.
+        scheduler.execute(new LongPollingClient(asyncContext, clientIp, clientPort, bootstrapInfo, HttpConstants.SERVER_MAX_HOLD_TIMEOUT, namespaceId));
+    }
+
+    private void reportInstanceInfo(final String clientIp, final String clientPort,
+                                    final String bootstrapInfo, final String namespaceId) {
+        if (shouldReportInstance(clientPort)) {
+            try {
+                InstanceInfoReportEvent instanceInfoReportEvent = InstanceInfoReportEvent.builder()
+                        .instanceIp(clientIp)
+                        .instancePort(clientPort)
+                        .instanceInfo(bootstrapInfo)
+                        .instanceType(InstanceTypeConstants.BOOTSTRAP_INSTANCE_TYPE)
+                        .instanceState(1)
+                        .namespaceId(namespaceId)
+                        .build();
+                InstanceInfoReportEventPublisher publisher = SpringBeanUtils.getInstance().getBean(InstanceInfoReportEventPublisher.class);
+                if (Objects.nonNull(publisher)) {
+                    publisher.publish(instanceInfoReportEvent);
+                }
+            } catch (Exception ex) {
+                LOG.error("report instance info error", ex);
+            }
+        }
+    }
+
+    private boolean shouldReportInstance(final String clientPort) {
+        return !StringUtils.isBlank(clientPort) && !CLIENT_PORT_ZERO.equals(clientPort);
+    }
+
+    @Override
+    protected void afterAppAuthChanged(final List<AppAuthData> changed, final DataEventTypeEnum eventType, final String namespaceId) {
+        notifyChanged(ConfigGroupEnum.APP_AUTH, namespaceId);
+    }
+
+    @Override
+    protected void afterMetaDataChanged(final List<MetaData> changed, final DataEventTypeEnum eventType, final String namespaceId) {
+        notifyChanged(ConfigGroupEnum.META_DATA, namespaceId);
+    }
+
+    @Override
+    protected void afterPluginChanged(final List<PluginData> changed, final DataEventTypeEnum eventType, final String namespaceId) {
+        notifyChanged(ConfigGroupEnum.PLUGIN, namespaceId);
+    }
+
+    @Override
+    protected void afterRuleChanged(final List<RuleData> changed, final DataEventTypeEnum eventType, final String namespaceId) {
+        notifyChanged(ConfigGroupEnum.RULE, namespaceId);
+    }
+
+    @Override
+    protected void afterSelectorChanged(final List<SelectorData> changed, final DataEventTypeEnum eventType, final String namespaceId) {
+        notifyChanged(ConfigGroupEnum.SELECTOR, namespaceId);
+    }
+
+    @Override
+    protected void afterProxySelectorChanged(final List<ProxySelectorData> changed, final DataEventTypeEnum eventType, final String namespaceId) {
+        notifyChanged(ConfigGroupEnum.PROXY_SELECTOR, namespaceId);
+    }
+
+    @Override
+    protected void afterDiscoveryUpstreamDataChanged(final List<DiscoverySyncData> changed, final DataEventTypeEnum eventType, final String namespaceId) {
+        notifyChanged(ConfigGroupEnum.DISCOVER_UPSTREAM, namespaceId);
+    }
+
+    private List<ConfigGroupEnum> compareChangedGroup(final HttpServletRequest request) {
+        List<ConfigGroupEnum> changedGroup = new ArrayList<>(ConfigGroupEnum.values().length);
+        String namespaceId = getNamespaceId(request);
+        for (ConfigGroupEnum group : ConfigGroupEnum.values()) {
+            // md5,lastModifyTime
+            String[] params = StringUtils.split(request.getParameter(group.name()), ',');
+            if (Objects.isNull(params) || params.length != 2) {
+                throw new ShenyuException("group param invalid:" + request.getParameter(group.name()));
+            }
+            String clientMd5 = params[0];
+            long clientModifyTime = NumberUtils.toLong(params[1]);
+
+            ConfigDataCache serverCache = CACHE.get(buildCacheKey(namespaceId, group.name()));
+            // do check.
+            if (this.checkCacheDelayAndUpdate(serverCache, clientMd5, clientModifyTime)) {
+                changedGroup.add(group);
+            }
+        }
+        return changedGroup;
+    }
+
+    public static String buildCacheKey(final String namespaceId, final String group) {
+        return namespaceId + "_" + group;
+    }
+
+    /**
+     * check whether the client needs to update the cache.
+     *
+     * @param serverCache      the admin local cache
+     * @param clientMd5        the client md5 value
+     * @param clientModifyTime the client last modify time
+     * @return true: the client needs to be updated, false: not need.
+     */
+    private boolean checkCacheDelayAndUpdate(final ConfigDataCache serverCache, final String clientMd5, final long clientModifyTime) {
+        // is the same, doesn't need to be updated
+        if (StringUtils.equals(clientMd5, serverCache.getMd5())) {
+            return false;
+        }
+        // if the md5 value is different, it is necessary to compare lastModifyTime.
+        long lastModifyTime = serverCache.getLastModifyTime();
+        if (lastModifyTime >= clientModifyTime) {
+            // the client's config is out of date.
+            return true;
+        }
+        // the lastModifyTime before client, then the local cache needs to be updated.
+        // Considering the concurrency problem, admin must lock,
+        // otherwise it may cause the request from shenyu-web to update the cache concurrently, causing excessive db pressure
+
+        // updateCache stores the namespace-qualified cache key in ConfigDataCache.group.
+        // Reuse it directly to avoid adding the namespace prefix twice.
+        String configDataCacheKey = serverCache.getGroup();
+
+        ConfigDataCache latest = CACHE.get(configDataCacheKey);
+        if (latest != serverCache) {
+            return !StringUtils.equals(clientMd5, latest.getMd5());
+        }
+        Object refreshLock = refreshLocks.computeIfAbsent(serverCache.getNamespaceId(), key -> new Object());
+        synchronized (refreshLock) {
+            latest = CACHE.get(configDataCacheKey);
+            if (latest != serverCache) {
+                return !StringUtils.equals(clientMd5, latest.getMd5());
+            }
+            this.refreshLocalCache(serverCache.getNamespaceId());
+            latest = CACHE.get(configDataCacheKey);
+            return !StringUtils.equals(clientMd5, latest.getMd5());
+        }
+    }
+
+    /**
+     * Send response datagram.
+     *
+     * @param response      the response
+     * @param changedGroups the changed groups
+     */
+    private void generateResponse(final HttpServletResponse response, final List<ConfigGroupEnum> changedGroups) {
+        try {
+            response.setHeader("Pragma", "no-cache");
+            response.setDateHeader("Expires", 0);
+            response.setHeader("Cache-Control", "no-cache,no-store");
+            response.setContentType(MediaType.APPLICATION_JSON_VALUE);
+            response.setStatus(HttpServletResponse.SC_OK);
+            response.getWriter().println(GsonUtils.getInstance().toJson(ShenyuAdminResult.success(ShenyuResultMessage.SUCCESS, changedGroups)));
+        } catch (IOException ex) {
+            LOG.error("Sending response failed.", ex);
+        }
+    }
+
+    /**
+     * get real client ip.
+     *
+     * @param request the request
+     * @return the remote ip
+     */
+    private static String getRemoteIp(final HttpServletRequest request) {
+        String xForwardedFor = request.getHeader(X_FORWARDED_FOR);
+        if (!StringUtils.isBlank(xForwardedFor)) {
+            return xForwardedFor.split(X_FORWARDED_FOR_SPLIT_SYMBOL)[0].trim();
+        }
+        String header = request.getHeader(X_REAL_IP);
+        return StringUtils.isBlank(header) ? request.getRemoteAddr() : header;
+    }
+
+    /**
+     * get namespaceId.
+     *
+     * @param request the request
+     * @return the namespaceId
+     */
+    private static String getNamespaceId(final HttpServletRequest request) {
+        String namespaceId = SYS_DEFAULT_NAMESPACE_ID;
+        if (StringUtils.isNotEmpty(request.getParameter("namespaceId"))) {
+            namespaceId = request.getParameter("namespaceId");
+        }
+        return namespaceId;
+    }
+
+    /**
+     * When a group's data changes, the thread is created to notify the client asynchronously.
+     */
+    class DataChangeTask implements Runnable {
+
+        /**
+         * The Group where the data has changed.
+         */
+        private final ConfigGroupEnum groupKey;
+
+        /**
+         * The Change time.
+         */
+        private final long changeTime = System.currentTimeMillis();
+
+        /**
+         * The namespaceId.
+         */
+        private final String namespaceId;
+
+        /**
+         * Instantiates a new Data change task.
+         *
+         * @param groupKey the group key
+         */
+        DataChangeTask(final ConfigGroupEnum groupKey, final String namespaceId) {
+            this.groupKey = groupKey;
+            this.namespaceId = namespaceId;
+        }
+
+        @Override
+        public void run() {
+            BlockingQueue<LongPollingClient> namespaceClients = clientsMap.get(namespaceId);
+            if (CollectionUtils.isEmpty(namespaceClients)) {
+                return;
+            }
+            List<LongPollingClient> targetClients = new ArrayList<>(namespaceClients.size());
+            namespaceClients.drainTo(targetClients);
+            if (targetClients.size() > httpSyncProperties.getNotifyBatchSize()) {
+                List<List<LongPollingClient>> partitionClients = Lists.partition(targetClients, httpSyncProperties.getNotifyBatchSize());
+                partitionClients.forEach(item -> scheduler.execute(() -> doRun(item)));
+            } else {
+                doRun(targetClients);
+            }
+        }
+
+        private void doRun(final Collection<LongPollingClient> clients) {
+            for (LongPollingClient client : clients) {
+                client.sendResponse(Collections.singletonList(groupKey));
+                LOG.info("send response with the changed group,ip={}, group={}, changeTime={}", client.ip, groupKey, changeTime);
+            }
+        }
+    }
+
+    /**
+     * If you exceed {@link HttpConstants#SERVER_MAX_HOLD_TIMEOUT} and still have no data change,
+     * empty data is returned. If the data changes within this time frame, the DataChangeTask
+     * cancellations the timed task and responds to the changed group data.
+     */
+    class LongPollingClient implements Runnable, AsyncListener {
+
+        private final Logger log = LoggerFactory.getLogger(LongPollingClient.class);
+
+        /**
+         * The Async context.
+         */
+        private final AsyncContext asyncContext;
+
+        /**
+         * The Ip.
+         */
+        private final String ip;
+
+        /**
+         * The Port.
+         */
+        private final String port;
+
+        /**
+         * The Bootstrap info.
+         */
+        private final String bootstrapInfo;
+
+        /**
+         * The Timeout time.
+         */
+        private final long timeoutTime;
+
+        /**
+         * The namespaceId.
+         */
+        private final String namespaceId;
+
+        /**
+         * The Async timeout future.
+         */
+        private ScheduledFuture<?> asyncTimeoutFuture;
+
+        /**
+         * The Heartbeat future.
+         */
+        private ScheduledFuture<?> heartbeatFuture;
+
+        /**
+         * Completed flag to prevent duplicate execution or responses.
+         */
+        private final AtomicBoolean isCompleted = new AtomicBoolean(false);
+
+        /**
+         * Instantiates a new Long polling client.
+         *
+         * @param ac          the ac
+         * @param ip          the ip
+         * @param timeoutTime the timeout time
+         * @param namespaceId the namespaceId
+         */
+        LongPollingClient(final AsyncContext ac, final String ip, final long timeoutTime, final String namespaceId) {
+            this(ac, ip, StringUtils.EMPTY, StringUtils.EMPTY, timeoutTime, namespaceId);
+        }
+
+        /**
+         * Instantiates a new Long polling client with port and bootstrap info.
+         *
+         * @param ac            the ac
+         * @param ip            the ip
+         * @param port          the port
+         * @param bootstrapInfo the bootstrap info
+         * @param timeoutTime   the timeout time
+         * @param namespaceId   the namespaceId
+         */
+        LongPollingClient(final AsyncContext ac, final String ip, final String port,
+                          final String bootstrapInfo, final long timeoutTime, final String namespaceId) {
+            this.asyncContext = ac;
+            this.ip = ip;
+            this.port = port;
+            this.bootstrapInfo = bootstrapInfo;
+            this.timeoutTime = timeoutTime;
+            this.namespaceId = namespaceId;
+            if (Objects.nonNull(ac)) {
+                try {
+                    ac.addListener(this);
+                } catch (Exception ex) {
+                    log.warn("failed to add async listener", ex);
+                }
+            }
+        }
+
+        @Override
+        public void run() {
+            // Fast-path lock-free check; thread-safety is guaranteed by atomic CAS in sendResponse.
+            if (isCompleted.get()) {
+                return;
+            }
+            try {
+                if (Objects.nonNull(cacheRebuildCoordinator)) {
+                    // Publication may race the request thread's first comparison. Registration and
+                    // notification share this scheduler, so recheck before entering the wait queue.
+                    List<ConfigGroupEnum> changedGroups = compareChangedGroup((HttpServletRequest) asyncContext.getRequest());
+                    if (CollectionUtils.isNotEmpty(changedGroups)) {
+                        sendResponse(changedGroups);
+                        return;
+                    }
+                }
+                BlockingQueue<LongPollingClient> namespaceClients = clientsMap.computeIfAbsent(
+                        namespaceId, k -> new ArrayBlockingQueue<>(1024));
+                this.asyncTimeoutFuture = scheduler.schedule(() -> {
+                    List<ConfigGroupEnum> changedGroups = compareChangedGroup((HttpServletRequest) asyncContext.getRequest());
+                    sendResponse(changedGroups);
+                    log.debug("LongPollingClient {} ", GsonUtils.getInstance().toJson(changedGroups));
+                }, timeoutTime, TimeUnit.MILLISECONDS);
+                if (shouldReportInstance(port)) {
+                    long interval = Objects.nonNull(httpSyncProperties) && httpSyncProperties.getHeartbeatInterval() > 0
+                            ? httpSyncProperties.getHeartbeatInterval() : DEFAULT_HEARTBEAT_INTERVAL_MS;
+                    ScheduledExecutorService executor = Objects.nonNull(livenessScheduler) ? livenessScheduler : scheduler;
+                    this.heartbeatFuture = executor.scheduleWithFixedDelay(
+                            this::refreshLiveness,
+                            interval,
+                            interval,
+                            TimeUnit.MILLISECONDS);
+                }
+                namespaceClients.add(this);
+            } catch (Exception ex) {
+                log.error("add long polling client error", ex);
+            }
+        }
+
+        /**
+         * Refreshes the liveness of active held client.
+         */
+        void refreshLiveness() {
+            try {
+                if (isCompleted.get()) {
+                    return;
+                }
+                BlockingQueue<LongPollingClient> namespaceClients = clientsMap.get(namespaceId);
+                if (Objects.isNull(namespaceClients) || !namespaceClients.contains(this)) {
+                    cleanUp();
+                    return;
+                }
+                reportInstanceInfo(ip, port, bootstrapInfo, namespaceId);
+                log.debug("LongPollingClient refreshed liveness for ip={}, port={}, namespaceId={}", ip, port, namespaceId);
+            } catch (Exception e) {
+                log.error("refresh long polling client liveness error", e);
+            }
+        }
+
+        /**
+         * Cleans up futures and removes client from queue.
+         */
+        void cleanUp() {
+            if (Objects.nonNull(asyncTimeoutFuture)) {
+                asyncTimeoutFuture.cancel(false);
+            }
+            if (Objects.nonNull(heartbeatFuture)) {
+                heartbeatFuture.cancel(false);
+            }
+            BlockingQueue<LongPollingClient> namespaceClients = clientsMap.get(namespaceId);
+            if (Objects.nonNull(namespaceClients)) {
+                namespaceClients.remove(this);
+            }
+        }
+
+        /**
+         * Send response.
+         *
+         * @param changedGroups the changed groups
+         */
+        void sendResponse(final List<ConfigGroupEnum> changedGroups) {
+            if (!isCompleted.compareAndSet(false, true)) {
+                cleanUp();
+                return;
+            }
+            cleanUp();
+            generateResponse((HttpServletResponse) asyncContext.getResponse(), changedGroups);
+            asyncContext.complete();
+        }
+
+        @Override
+        public void onComplete(final AsyncEvent event) {
+            cleanUp();
+        }
+
+        @Override
+        public void onTimeout(final AsyncEvent event) {
+            isCompleted.set(true);
+            cleanUp();
+        }
+
+        @Override
+        public void onError(final AsyncEvent event) {
+            isCompleted.set(true);
+            cleanUp();
+        }
+
+        @Override
+        public void onStartAsync(final AsyncEvent event) {
+        }
+
+        ScheduledFuture<?> getHeartbeatFuture() {
+            return heartbeatFuture;
+        }
+
+        ScheduledFuture<?> getAsyncTimeoutFuture() {
+            return asyncTimeoutFuture;
+        }
+
+        boolean isCompleted() {
+            return isCompleted.get();
+        }
+    }
+}

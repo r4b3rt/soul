@@ -1,0 +1,74 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.shenyu.admin.config;
+
+import org.apache.shenyu.admin.config.properties.RegistrationFencingProperties;
+import org.apache.shenyu.register.common.protocol.RegistrationProtocol;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.web.servlet.config.annotation.CorsRegistry;
+import org.springframework.web.servlet.config.annotation.InterceptorRegistry;
+import org.springframework.web.servlet.config.annotation.PathMatchConfigurer;
+import org.springframework.web.servlet.config.annotation.WebMvcConfigurer;
+import org.springframework.web.util.pattern.PathPatternParser;
+
+/**
+ * web handler.
+ */
+@Configuration
+public class WebConfiguration implements WebMvcConfigurer {
+
+    private final RegistrationFencingProperties fencingProperties;
+
+    public WebConfiguration() {
+        this.fencingProperties = new RegistrationFencingProperties();
+    }
+
+    @Autowired
+    public WebConfiguration(final RegistrationFencingProperties fencingProperties) {
+        this.fencingProperties = fencingProperties;
+    }
+
+    @Override
+    public void addInterceptors(final InterceptorRegistry registry) {
+        registry.addInterceptor(new RegistrationProtocolInterceptor(fencingProperties)).addPathPatterns(
+                RegistrationProtocol.META_PATH, RegistrationProtocol.URI_PATH, RegistrationProtocol.API_DOC_PATH,
+                RegistrationProtocol.DISCOVERY_CONFIG_PATH, RegistrationProtocol.MCP_TOOLS_PATH,
+                RegistrationProtocol.OFFLINE_PATH, RegistrationProtocol.BEAT_URI_PATH);
+    }
+
+    @Override
+    public void addCorsMappings(final CorsRegistry registry) {
+        registry.addMapping("/**")
+                .allowedHeaders("Access-Control-Allow-Origin",
+                        "*",
+                        "Access-Control-Allow-Methods",
+                        "POST, GET, OPTIONS, PUT, DELETE",
+                        "Access-Control-Allow-Headers",
+                        "Origin, X-Requested-With, Content-Type, Accept")
+                .allowedOrigins("*")
+                .allowedMethods("*");
+    }
+
+    @Override
+    public void configurePathMatch(final PathMatchConfigurer configurer) {
+        final PathPatternParser parser = new PathPatternParser();
+        parser.setMatchOptionalTrailingSeparator(true);
+        configurer.setPatternParser(parser);
+    }
+}

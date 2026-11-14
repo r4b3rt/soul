@@ -1,0 +1,210 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.shenyu.admin.shiro.config;
+
+import org.apache.shenyu.admin.config.properties.JwtProperties;
+import org.apache.shenyu.admin.model.custom.UserInfo;
+import org.apache.shenyu.admin.model.vo.DashboardUserVO;
+import org.apache.shenyu.admin.service.DashboardUserService;
+import org.apache.shenyu.admin.service.PermissionService;
+import org.apache.shenyu.admin.utils.JwtUtils;
+import org.apache.shiro.authc.AuthenticationException;
+import org.apache.shiro.authc.AuthenticationInfo;
+import org.apache.shiro.authc.AuthenticationToken;
+import org.apache.shiro.authc.BearerToken;
+import org.apache.shiro.authz.AuthorizationInfo;
+import org.apache.shiro.subject.PrincipalCollection;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.InjectMocks;
+import org.mockito.Mock;
+import org.mockito.junit.jupiter.MockitoExtension;
+import org.mockito.junit.jupiter.MockitoSettings;
+import org.mockito.quality.Strictness;
+
+import java.util.HashSet;
+import java.util.Set;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
+
+/**
+ * Test cases for {@link ShiroRealm}.
+ */
+@ExtendWith(MockitoExtension.class)
+@MockitoSettings(strictness = Strictness.LENIENT)
+public final class ShiroRealmTest {
+
+    private static final String SECRETKEY = "123456";
+
+    @InjectMocks
+    private ShiroRealm shiroRealm;
+
+    @Mock
+    private PermissionService permissionService;
+
+    @Mock
+    private DashboardUserService dashboardUserService;
+
+    @Mock
+    private JwtProperties jwtProperties;
+
+    @Test
+    public void testSupports() {
+        BearerToken token = mock(BearerToken.class);
+        assertTrue(shiroRealm.supports(token));
+    }
+
+    @Test
+    public void testDoGetAuthorizationInfo() {
+        PrincipalCollection principalCollection = mock(PrincipalCollection.class);
+        UserInfo userInfo = new UserInfo();
+
+        Set<String> strings = new HashSet<>();
+        when(principalCollection.getPrimaryPrincipal()).thenReturn(userInfo);
+        when(permissionService.getAuthPermByUserName(any())).thenReturn(strings);
+        assertNull(shiroRealm.doGetAuthorizationInfo(principalCollection));
+
+        strings.add("test");
+        when(principalCollection.getPrimaryPrincipal()).thenReturn(userInfo);
+        when(permissionService.getAuthPermByUserName(any())).thenReturn(strings);
+        AuthorizationInfo info = shiroRealm.doGetAuthorizationInfo(principalCollection);
+        assertEquals(strings, info.getStringPermissions());
+    }
+
+    @Test
+    public void testDoGetAuthenticationInfo() {
+        final AuthenticationToken token = mock(AuthenticationToken.class);
+        final DashboardUserVO dashboardUserVO = mock(DashboardUserVO.class);
+
+        when(token.getCredentials()).thenReturn(null);
+        assertNull(shiroRealm.doGetAuthenticationInfo(token));
+
+        AuthenticationException exception1 = assertThrows(AuthenticationException.class, () -> {
+            when(token.getCredentials()).thenReturn("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"
+                    + ".eyJzdWIiOiIxMjM0NTY3ODkwIiwidXNlck5hbWUiOiJKb2huIERvZSIsImlhdCI6MTUxNjIzOTAyMn0"
+                    + ".Qlpf6FdKAffgceukbi2BQYdPVf71d4Nwy0YQlkiTQFc");
+            shiroRealm.doGetAuthenticationInfo(token);
+        });
+        assertNotNull(exception1);
+
+        AuthenticationException exception2 = assertThrows(AuthenticationException.class, () -> {
+            when(dashboardUserService.findByUserName(any())).thenReturn(null);
+            when(token.getCredentials()).thenReturn("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"
+                    + ".eyJzdWIiOiIxMjM0NTY3ODkwIiwidXNlck5hbWUiOiJKb2huIERvZSIsImlhdCI6MTUxNjIzOTAyMn0"
+                    + ".Qlpf6FdKAffgceukbi2BQYdPVf71d4Nwy0YQlkiTQFc");
+            shiroRealm.doGetAuthenticationInfo(token);
+        });
+        assertNotNull(exception2);
+
+        AuthenticationException exception3 = assertThrows(AuthenticationException.class, () -> {
+            when(dashboardUserService.findByUserName(any())).thenReturn(dashboardUserVO);
+            when(dashboardUserVO.getEnabled()).thenReturn(false);
+            when(token.getCredentials()).thenReturn("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"
+                    + ".eyJzdWIiOiIxMjM0NTY3ODkwIiwidXNlck5hbWUiOiJKb2huIERvZSIsImlhdCI6MTUxNjIzOTAyMn0"
+                    + ".Qlpf6FdKAffgceukbi2BQYdPVf71d4Nwy0YQlkiTQFc");
+            shiroRealm.doGetAuthenticationInfo(token);
+        });
+        assertNotNull(exception3);
+
+        AuthenticationException exception4 = assertThrows(AuthenticationException.class, () -> {
+            when(dashboardUserService.findByUserName(any())).thenReturn(dashboardUserVO);
+            when(dashboardUserVO.getEnabled()).thenReturn(true);
+            when(jwtProperties.getSecretKey()).thenReturn("wrongKey");
+            when(token.getCredentials()).thenReturn("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"
+                    + ".eyJzdWIiOiIxMjM0NTY3ODkwIiwidXNlck5hbWUiOiJKb2huIERvZSIsImlhdCI6MTUxNjIzOTAyMn0"
+                    + ".Qlpf6FdKAffgceukbi2BQYdPVf71d4Nwy0YQlkiTQFc");
+            shiroRealm.doGetAuthenticationInfo(token);
+        });
+        assertNotNull(exception4);
+
+        when(dashboardUserService.findByUserName(any())).thenReturn(dashboardUserVO);
+        when(dashboardUserVO.getEnabled()).thenReturn(true);
+        when(jwtProperties.getSecretKey()).thenReturn(SECRETKEY);
+        when(token.getCredentials()).thenReturn("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"
+                + ".eyJzdWIiOiIxMjM0NTY3ODkwIiwidXNlck5hbWUiOiJKb2huIERvZSIsImlhdCI6MTUxNjIzOTAyMn0"
+                + ".Qlpf6FdKAffgceukbi2BQYdPVf71d4Nwy0YQlkiTQFc");
+        AuthenticationInfo info = shiroRealm.doGetAuthenticationInfo(token);
+        assertNotNull(info);
+    }
+
+    @Test
+    public void testDoGetAuthenticationInfoRejectsRevokedToken() {
+        final AuthenticationToken token = mock(AuthenticationToken.class);
+        final DashboardUserVO dashboardUserVO = mock(DashboardUserVO.class);
+        when(dashboardUserService.findByUserName(any())).thenReturn(dashboardUserVO);
+        when(dashboardUserVO.getEnabled()).thenReturn(true);
+        when(jwtProperties.getSecretKey()).thenReturn(SECRETKEY);
+        when(token.getCredentials()).thenReturn(JwtUtils.generateToken("userName", SECRETKEY, "clientId", 1L, 3600L));
+
+        // the token matches the account's current version
+        when(dashboardUserVO.getTokenVersion()).thenReturn(1L);
+        assertNotNull(shiroRealm.doGetAuthenticationInfo(token));
+
+        // a password change or an explicit revocation bumps the stored version
+        when(dashboardUserVO.getTokenVersion()).thenReturn(2L);
+        AuthenticationException revoked = assertThrows(AuthenticationException.class,
+                () -> shiroRealm.doGetAuthenticationInfo(token));
+        assertNotNull(revoked);
+    }
+
+    @Test
+    public void testPasswordChangeInvalidatesOldTokenAndAcceptsFreshLogin() {
+        final DashboardUserVO dashboardUserVO = new DashboardUserVO();
+        dashboardUserVO.setUserName("userName");
+        dashboardUserVO.setEnabled(true);
+        dashboardUserVO.setTokenVersion(0L);
+        when(dashboardUserService.findByUserName(any())).thenReturn(dashboardUserVO);
+        when(jwtProperties.getSecretKey()).thenReturn(SECRETKEY);
+
+        String oldToken = JwtUtils.generateToken("userName", SECRETKEY, "clientId", 0L, 3600L);
+        assertNotNull(shiroRealm.doGetAuthenticationInfo(new BearerToken(oldToken)));
+
+        // a password change moves the account to the next version
+        dashboardUserVO.setTokenVersion(1L);
+        assertThrows(AuthenticationException.class,
+                () -> shiroRealm.doGetAuthenticationInfo(new BearerToken(oldToken)));
+
+        // a fresh login issues a token carrying the current version
+        String freshToken = JwtUtils.generateToken("userName", SECRETKEY, "clientId", 1L, 3600L);
+        assertNotNull(shiroRealm.doGetAuthenticationInfo(new BearerToken(freshToken)));
+    }
+
+    @Test
+    public void testDoGetAuthenticationInfoAcceptsLegacyTokenUntilRevoked() {
+        final AuthenticationToken token = mock(AuthenticationToken.class);
+        final DashboardUserVO dashboardUserVO = mock(DashboardUserVO.class);
+        when(dashboardUserService.findByUserName(any())).thenReturn(dashboardUserVO);
+        when(dashboardUserVO.getEnabled()).thenReturn(true);
+        when(jwtProperties.getSecretKey()).thenReturn(SECRETKEY);
+        // tokens issued before token versioning carry no version claim
+        when(token.getCredentials()).thenReturn(JwtUtils.generateToken("userName", SECRETKEY, "clientId", 3600L));
+
+        when(dashboardUserVO.getTokenVersion()).thenReturn(JwtUtils.LEGACY_TOKEN_VERSION);
+        assertNotNull(shiroRealm.doGetAuthenticationInfo(token));
+
+        when(dashboardUserVO.getTokenVersion()).thenReturn(1L);
+        assertThrows(AuthenticationException.class, () -> shiroRealm.doGetAuthenticationInfo(token));
+    }
+}

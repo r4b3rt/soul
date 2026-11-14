@@ -1,0 +1,165 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.shenyu.protocol.mqtt;
+
+import io.netty.channel.Channel;
+import io.netty.channel.ChannelHandlerContext;
+import io.netty.handler.codec.mqtt.MqttConnAckMessage;
+import io.netty.handler.codec.mqtt.MqttConnectMessage;
+import io.netty.handler.codec.mqtt.MqttConnectReturnCode;
+import io.netty.handler.codec.mqtt.MqttMessageBuilders;
+import io.netty.handler.codec.mqtt.MqttVersion;
+import org.apache.commons.lang3.StringUtils;
+import org.apache.shenyu.common.utils.Singleton;
+import org.apache.shenyu.protocol.mqtt.repositories.ChannelRepository;
+import org.apache.shenyu.protocol.mqtt.repositories.InflightRepository;
+import org.apache.shenyu.protocol.mqtt.repositories.MqttSession;
+import org.apache.shenyu.protocol.mqtt.repositories.SessionRepository;
+import org.apache.shenyu.protocol.mqtt.repositories.SubscribeRepository;
+import org.apache.shenyu.protocol.mqtt.repositories.WillRepository;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.Objects;
+
+import static io.netty.channel.ChannelFutureListener.CLOSE_ON_FAILURE;
+import static io.netty.handler.codec.mqtt.MqttConnectReturnCode.CONNECTION_REFUSED_BAD_USER_NAME_OR_PASSWORD;
+import static io.netty.handler.codec.mqtt.MqttConnectReturnCode.CONNECTION_REFUSED_IDENTIFIER_REJECTED;
+import static io.netty.handler.codec.mqtt.MqttConnectReturnCode.CONNECTION_REFUSED_UNACCEPTABLE_PROTOCOL_VERSION;
+
+/**
+ * Client requests a connection to a server.
+ */
+public class Connect extends MessageType {
+
+    private static final Logger LOG = LoggerFactory.getLogger(Connect.class);
+
+    @Override
+    public void connect(final ChannelHandlerContext ctx, final MqttConnectMessage msg) {
+
+        if (isConnected(ctx.channel())) {
+            LOG.info("MQTT client has already sent a CONNECT packet, closing connection.");
+            ctx.close().addListener(CLOSE_ON_FAILURE);
+            return;
+        }
+
+        String clientId = msg.payload().clientIdentifier();
+        if (StringUtils.isEmpty(clientId)) {
+            LOG.info("MQTT clientId can not be empty.");
+            close(ctx, CONNECTION_REFUSED_IDENTIFIER_REJECTED);
+            return;
+        }
+
+        if (!allowedProtocolVersion(msg)) {
+            LOG.info("MQTT protocol version is not supported. clientId: {}", clientId);
+            close(ctx, CONNECTION_REFUSED_UNACCEPTABLE_PROTOCOL_VERSION);
+            return;
+        }
+
+        String userName = msg.payload().userName();
+        byte[] passwordInBytes = msg.payload().passwordInBytes();
+
+        if (!MqttContext.isValid(userName, passwordInBytes)) {
+            LOG.info("MQTT client verification failed, please check the username and password.");
+            close(ctx, CONNECTION_REFUSED_BAD_USER_NAME_OR_PASSWORD);
+            return;
+        }
+
+        // record connect and take over the client id: a duplicate clientId must
+        // replace the existing connection instead of coexisting with it (#7918)
+        takeOverClientId(ctx.channel(), clientId);
+
+        // store will if present
+        if (msg.variableHeader().isWillFlag()) {
+            WillRepository.WillEntry will = new WillRepository.WillEntry(
+                    msg.payload().willTopic(),
+                    msg.payload().willMessageInBytes(),
+                    msg.variableHeader().willQos(),
+                    msg.variableHeader().isWillRetain());
+            Singleton.INST.get(WillRepository.class).add(ctx.channel(), will);
+        }
+
+        boolean cleanSession = msg.variableHeader().isCleanSession();
+        SessionRepository sessionRepository = Singleton.INST.get(SessionRepository.class);
+        MqttSession session = sessionRepository.get(clientId);
+        // MQTT-3.2.2-6/7: session present is only true when the client connects
+        // with cleanSession=0 and the server holds a stored session for the clientId.
+        boolean sessionPresent = !cleanSession && Objects.nonNull(session);
+        if (cleanSession) {
+            // A clean-session connect must discard any previously stored session.
+            session = new MqttSession(clientId, true);
+            sessionRepository.add(clientId, session);
+        } else if (Objects.isNull(session)) {
+            session = new MqttSession(clientId, false);
+            sessionRepository.add(clientId, session);
+        }
+        if (sessionPresent && !session.getTopics().isEmpty()) {
+            // Resume the stored subscriptions (with their QoS) for the new channel.
+            Singleton.INST.get(SubscribeRepository.class)
+                    .add(ctx.channel(), session.getTopicSubscriptions());
+        }
+        if (!sessionPresent) {
+            // a new session resets the packet id space, so stale inbound ids must
+            // not suppress new publishes on this connection (#7919)
+            Singleton.INST.get(InflightRepository.class).remove(clientId);
+        }
+
+        MqttConnAckMessage ackMessage = MqttMessageBuilders.connAck()
+                .returnCode(MqttConnectReturnCode.CONNECTION_ACCEPTED)
+                .sessionPresent(sessionPresent)
+                .build();
+        ctx.writeAndFlush(ackMessage);
+        setConnected(ctx.channel(), true);
+    }
+
+    /**
+     * Takes over the client id for the new channel, closing the connection that
+     * owned it before, if any.
+     *
+     * @param channel the channel of the new connection
+     * @param clientId the announced client identifier
+     */
+    private void takeOverClientId(final Channel channel, final String clientId) {
+        final Channel previous = Singleton.INST.get(ChannelRepository.class).takeover(channel, clientId);
+        if (Objects.nonNull(previous) && previous != channel) {
+            LOG.info("MQTT clientId {} is already connected, closing the previous connection.", clientId);
+            // the replaced connection's will is discarded: the client is alive on the new connection
+            Singleton.INST.get(WillRepository.class).remove(previous);
+            previous.close();
+        }
+    }
+
+    private void close(final ChannelHandlerContext ctx, final MqttConnectReturnCode returnCode) {
+        ctx.writeAndFlush(wrong(returnCode));
+        ctx.close().addListener(CLOSE_ON_FAILURE);
+    }
+
+    private MqttConnAckMessage wrong(final MqttConnectReturnCode returnCode) {
+        return MqttMessageBuilders.connAck()
+                .returnCode(returnCode)
+                .sessionPresent(false)
+                .build();
+    }
+
+    private boolean allowedProtocolVersion(final MqttConnectMessage msg) {
+        int protocolLevel = msg.variableHeader().version();
+        return protocolLevel == MqttVersion.MQTT_3_1.protocolLevel()
+                || protocolLevel == MqttVersion.MQTT_3_1_1.protocolLevel()
+                || protocolLevel == MqttVersion.MQTT_5.protocolLevel();
+    }
+}

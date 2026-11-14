@@ -1,0 +1,154 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.shenyu.plugin.cryptor.utils;
+
+import com.google.common.collect.Lists;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+import org.apache.commons.lang3.StringUtils;
+import org.apache.commons.lang3.tuple.Pair;
+import org.apache.shenyu.common.utils.GsonUtils;
+import org.springframework.util.CollectionUtils;
+
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.Collectors;
+
+/**
+ * json util.
+ */
+public final class JsonUtil {
+    
+    private JsonUtil() {
+    }
+
+    /**
+     * parser JSON.
+     * @param json json Map
+     * @param fieldName fieldName
+     * @return str.
+     */
+    public static String parser(final String json, final String fieldName) {
+        Map<String, Object> map = GsonUtils.getInstance().toObjectMap(json);
+        if (Objects.isNull(map)) {
+            return null;
+        }
+        String str = null;
+        if (fieldName.contains(".")) {
+            String[] split = fieldName.split("\\.");
+            Object firstElement = map.get(split[0]);
+            if (!(firstElement instanceof JsonObject)) {
+                return null;
+            }
+            JsonObject jsonObject = (JsonObject) firstElement;
+            for (int i = 1; i < split.length; i++) {
+                JsonElement jsonElement = jsonObject.get(split[i]);
+                if (Objects.isNull(jsonElement)) {
+                    return null;
+                }
+                if (i == split.length - 1) {
+                    if (!jsonElement.isJsonPrimitive()) {
+                        return null;
+                    }
+                    str = jsonElement.getAsString();
+                } else {
+                    if (!jsonElement.isJsonObject()) {
+                        return null;
+                    }
+                    jsonObject = jsonElement.getAsJsonObject();
+                }
+            }
+        } else {
+            return Objects.isNull(map.get(fieldName)) ? null : map.get(fieldName).toString();
+        }
+        return str;
+    }
+
+    /**
+     * parser JSON.
+     * @param json json Map
+     * @param fieldNames params
+     * @return str.
+     */
+    public static List<Pair<String, String>> parser(final String json, final Set<String> fieldNames) {
+        if (CollectionUtils.isEmpty(fieldNames) || StringUtils.isBlank(json)) {
+            return Lists.newArrayList();
+        }
+        return fieldNames.stream().filter(StringUtils::isNoneBlank)
+                .map(field -> Pair.of(field, parser(json, field)))
+                .filter(pair -> StringUtils.isNoneBlank(pair.getRight()))
+                .collect(Collectors.toList());
+    }
+
+    /**
+     * operate json.
+     * @param jsonElement jsonElement
+     * @param startDepth starting path index, normally 0; retained as AtomicInteger for compatibility and never mutated
+     * @param value The value that needs to be modified
+     * @param deepKey json link
+     * @return JsonElement
+     */
+    public static JsonElement replaceJsonNode(final JsonElement jsonElement,
+                                              final AtomicInteger startDepth,
+                                              final String value,
+                                              final List<String> deepKey) {
+        if (CollectionUtils.isEmpty(deepKey)) {
+            return jsonElement;
+        }
+        return replaceJsonNode(jsonElement, startDepth.get(), value, deepKey);
+    }
+
+    private static JsonElement replaceJsonNode(final JsonElement jsonElement,
+                                               final int depth,
+                                               final String value,
+                                               final List<String> deepKey) {
+        if (depth < 0 || depth >= deepKey.size() || jsonElement.isJsonPrimitive()) {
+            return jsonElement;
+        }
+        if (jsonElement.isJsonArray()) {
+            JsonArray jsonArray = jsonElement.getAsJsonArray();
+            JsonArray jsonArrayNew = new JsonArray();
+            for (JsonElement element : jsonArray) {
+                jsonArrayNew.add(replaceJsonNode(element, depth, value, deepKey));
+            }
+            return jsonArrayNew;
+        }
+
+        if (jsonElement.isJsonObject()) {
+            JsonObject object = jsonElement.getAsJsonObject();
+            JsonObject objectNew = new JsonObject();
+            for (Map.Entry<String, JsonElement> entry : object.entrySet()) {
+                String key = entry.getKey();
+                JsonElement child = entry.getValue();
+                if (!deepKey.get(depth).equals(key)) {
+                    objectNew.add(key, child);
+                } else if (depth == deepKey.size() - 1) {
+                    objectNew.addProperty(key, value);
+                } else {
+                    objectNew.add(key, replaceJsonNode(child, depth + 1, value, deepKey));
+                }
+            }
+            return objectNew;
+        }
+        return jsonElement;
+    }
+}

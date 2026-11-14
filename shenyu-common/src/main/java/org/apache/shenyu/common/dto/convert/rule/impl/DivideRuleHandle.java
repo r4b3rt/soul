@@ -1,0 +1,338 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.shenyu.common.dto.convert.rule.impl;
+
+import org.apache.shenyu.common.constant.Constants;
+import org.apache.shenyu.common.dto.convert.rule.RuleHandle;
+import org.apache.shenyu.common.dto.convert.rule.canary.CanaryConfig;
+import org.apache.shenyu.common.dto.convert.rule.sticky.StickySessionConfig;
+import org.apache.shenyu.common.enums.HttpRetryBackoffSpecEnum;
+import org.apache.shenyu.common.enums.LoadBalanceEnum;
+import org.apache.shenyu.common.enums.RetryEnum;
+
+import java.util.Objects;
+
+/**
+ * The type Divide rule handle.
+ */
+public class DivideRuleHandle implements RuleHandle {
+
+    /**
+     * loadBalance.
+     * {@linkplain LoadBalanceEnum}
+     */
+    private String loadBalance = LoadBalanceEnum.RANDOM.getName();
+
+    /**
+     * retryStrategy.
+     * {@linkplain RetryEnum}
+     */
+    private String retryStrategy = RetryEnum.CURRENT.getName();
+
+    private String retryBackOffSpec = HttpRetryBackoffSpecEnum.getDefault();
+
+    /**
+     * http retry.
+     */
+    private int retry = 3;
+
+    /**
+     * timeout is required.
+     */
+    private long timeout = Constants.TIME_OUT;
+
+    /** Overall HTTPRoute timeout in milliseconds; null selects legacy timeout handling. */
+    private Long requestTimeout;
+
+    /**
+     * headerMaxSize.
+     */
+    private long headerMaxSize;
+
+    /**
+     * requestMaxSize.
+     */
+    private long requestMaxSize;
+
+    /**
+     * Canary routing configuration.
+     */
+    private CanaryConfig canary;
+
+    /**
+     * Optional sticky session affinity configuration.
+     */
+    private StickySessionConfig sticky;
+
+    /**
+     * Optional name of a configured upstream connection-pool group (see
+     * {@code shenyu.httpclient.pool-groups}); null selects the default shared pool.
+     * The name must reference a group that exists at gateway startup; an unknown
+     * reference visibly fails the request instead of falling back silently.
+     */
+    private String poolGroup;
+
+    /**
+     * Get the overall HTTPRoute request budget.
+     * @return milliseconds, zero for a disabled deadline, or null for legacy retry handling
+     */
+    public Long getRequestTimeout() {
+        return requestTimeout;
+    }
+
+    /**
+     * Set the overall HTTPRoute request budget.
+     * @param requestTimeout milliseconds, zero for a disabled deadline, or null for legacy retry handling
+     */
+    public void setRequestTimeout(final Long requestTimeout) {
+        this.requestTimeout = requestTimeout;
+    }
+
+    /**
+     * Gets the optional pool group name.
+     *
+     * @return the pool group name, or null for the default pool
+     */
+    public String getPoolGroup() {
+        return poolGroup;
+    }
+
+    /**
+     * Sets the optional pool group name.
+     *
+     * @param poolGroup the pool group name
+     */
+    public void setPoolGroup(final String poolGroup) {
+        this.poolGroup = poolGroup;
+    }
+
+    /**
+     * New instance divide rule handle.
+     *
+     * @return the divide rule handle
+     */
+    public static DivideRuleHandle newInstance() {
+        return new DivideRuleHandle();
+    }
+    
+    /**
+     * get loadBalance.
+     *
+     * @return loadBalance load balance
+     */
+    public String getLoadBalance() {
+        return loadBalance;
+    }
+    
+    /**
+     * set loadBalance.
+     *
+     * @param loadBalance loadBalance
+     */
+    public void setLoadBalance(final String loadBalance) {
+        this.loadBalance = loadBalance;
+    }
+    
+    /**
+     * get retryStrategy.
+     *
+     * @return retryStrategy retry strategy
+     */
+    public String getRetryStrategy() {
+        return retryStrategy;
+    }
+    
+    /**
+     * set retryStrategy.
+     *
+     * @param retryStrategy retryStrategy
+     */
+    public void setRetryStrategy(final String retryStrategy) {
+        this.retryStrategy = retryStrategy;
+    }
+    
+    /**
+     * get retry.
+     *
+     * @return retry retry
+     */
+    public int getRetry() {
+        return retry;
+    }
+    
+    /**
+     * set retry.
+     *
+     * @param retry retry
+     */
+    public void setRetry(final int retry) {
+        this.retry = retry;
+    }
+    
+    /**
+     * get timeout.
+     *
+     * @return timeout timeout
+     */
+    public long getTimeout() {
+        return timeout;
+    }
+    
+    /**
+     * set timeout.
+     *
+     * @param timeout timeout
+     */
+    public void setTimeout(final long timeout) {
+        this.timeout = timeout;
+    }
+    
+    /**
+     * get headerMaxSize.
+     *
+     * @return headerMaxSize header max size
+     */
+    public long getHeaderMaxSize() {
+        return headerMaxSize;
+    }
+    
+    /**
+     * set headerMaxSize.
+     *
+     * @param headerMaxSize headerMaxSize
+     */
+    public void setHeaderMaxSize(final long headerMaxSize) {
+        this.headerMaxSize = headerMaxSize;
+    }
+    
+    /**
+     * get requestMaxSize.
+     *
+     * @return requestMaxSize request max size
+     */
+    public long getRequestMaxSize() {
+        return requestMaxSize;
+    }
+    
+    /**
+     * set requestMaxSize.
+     *
+     * @param requestMaxSize requestMaxSize
+     */
+    public void setRequestMaxSize(final long requestMaxSize) {
+        this.requestMaxSize = requestMaxSize;
+    }
+
+    /**
+     * Get canary configuration.
+     *
+     * @return canary configuration
+     */
+    public CanaryConfig getCanary() {
+        return canary;
+    }
+
+    /**
+     * Set canary configuration.
+     *
+     * @param canary canary configuration
+     */
+    public void setCanary(final CanaryConfig canary) {
+        this.canary = canary;
+    }
+
+    /**
+     * get sticky.
+     *
+     * @return sticky
+     */
+    public StickySessionConfig getSticky() {
+        return sticky;
+    }
+
+    /**
+     * set sticky.
+     *
+     * @param sticky sticky
+     */
+    public void setSticky(final StickySessionConfig sticky) {
+        this.sticky = sticky;
+    }
+
+
+    public String getRetryBackOffSpec() {
+        return retryBackOffSpec;
+    }
+
+    public void setRetryBackOffSpec(final String retryBackOffSpec) {
+        this.retryBackOffSpec = retryBackOffSpec;
+    }
+
+    @Override
+    public boolean equals(final Object o) {
+        if (this == o) {
+            return true;
+        }
+        if (Objects.isNull(o) || getClass() != o.getClass()) {
+            return false;
+        }
+        DivideRuleHandle that = (DivideRuleHandle) o;
+        return retry == that.retry && timeout == that.timeout && headerMaxSize == that.headerMaxSize
+                && requestMaxSize == that.requestMaxSize && Objects.equals(loadBalance, that.loadBalance)
+                && Objects.equals(requestTimeout, that.requestTimeout) && Objects.equals(retryStrategy, that.retryStrategy)
+                && Objects.equals(retryBackOffSpec, that.retryBackOffSpec) && Objects.equals(canary, that.canary)
+                && Objects.equals(sticky, that.sticky) && Objects.equals(poolGroup, that.poolGroup);
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hash(loadBalance, retryStrategy, retryBackOffSpec, retry, timeout, requestTimeout, headerMaxSize, requestMaxSize, canary, sticky, poolGroup);
+    }
+
+    @Override
+    public String toString() {
+        return "DivideRuleHandle{"
+                + "loadBalance='"
+                + loadBalance
+                + '\''
+                + ", retryStrategy='"
+                + retryStrategy
+                + '\''
+                + ", retryBackOffSpec='"
+                + retryBackOffSpec
+                + '\''
+                + ", retry="
+                + retry
+                + ", timeout="
+                + timeout
+                + ", requestTimeout="
+                + requestTimeout
+                + ", headerMaxSize="
+                + headerMaxSize
+                + ", requestMaxSize="
+                + requestMaxSize
+                + ", canary="
+                + canary
+                + ", sticky="
+                + sticky
+                + ", poolGroup='"
+                + poolGroup
+                + '\''
+                + '}';
+    }
+}

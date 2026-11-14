@@ -1,0 +1,130 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.shenyu.protocol.mqtt;
+
+import io.netty.buffer.Unpooled;
+import io.netty.channel.Channel;
+import io.netty.channel.ChannelHandlerContext;
+import io.netty.handler.codec.mqtt.MqttFixedHeader;
+import io.netty.handler.codec.mqtt.MqttSubscribeMessage;
+import io.netty.handler.codec.mqtt.MqttTopicSubscription;
+import io.netty.handler.codec.mqtt.MqttMessageType;
+import io.netty.handler.codec.mqtt.MqttSubAckPayload;
+import io.netty.handler.codec.mqtt.MqttSubAckMessage;
+import io.netty.handler.codec.mqtt.MqttPublishVariableHeader;
+import io.netty.handler.codec.mqtt.MqttPublishMessage;
+import org.apache.shenyu.common.utils.Singleton;
+import org.apache.shenyu.protocol.mqtt.repositories.ChannelRepository;
+import org.apache.shenyu.protocol.mqtt.repositories.MqttSession;
+import org.apache.shenyu.protocol.mqtt.repositories.SessionRepository;
+import org.apache.shenyu.protocol.mqtt.repositories.SubscribeRepository;
+import org.apache.shenyu.protocol.mqtt.repositories.TopicRepository;
+
+import java.util.List;
+import java.util.Objects;
+import java.util.stream.Collectors;
+
+import static io.netty.channel.ChannelFutureListener.FIRE_EXCEPTION_ON_FAILURE;
+import static io.netty.handler.codec.mqtt.MqttMessageIdVariableHeader.from;
+import static io.netty.handler.codec.mqtt.MqttQoS.AT_MOST_ONCE;
+import static io.netty.handler.codec.mqtt.MqttQoS.FAILURE;
+
+/**
+ *  Subscribe to named topics.
+ */
+public class Subscribe extends MessageType {
+
+    @Override
+    public void subscribe(final ChannelHandlerContext ctx, final MqttSubscribeMessage msg) {
+        Channel channel = ctx.channel();
+
+        if (!isConnected(channel)) {
+            channel.close().addListener(FIRE_EXCEPTION_ON_FAILURE);
+            return;
+        }
+        List<MqttTopicSubscription> mqttTopicSubscriptions = msg.payload().topicSubscriptions();
+        int packetId = msg.variableHeader().messageId();
+
+        //// todo Regular match
+        List<MqttTopicSubscription> ackSubscriptions = mqttTopicSubscriptions
+                .stream()
+                .filter(topicSub -> topicSub.qualityOfService() != FAILURE)
+                .collect(Collectors.toList());
+
+        List<String> ackTopics = ackSubscriptions.stream()
+                .map(MqttTopicSubscription::topicName)
+                .collect(Collectors.toList());
+
+        Singleton.INST.get(SubscribeRepository.class).add(ctx.channel(), mqttTopicSubscriptions);
+
+        String clientId = Singleton.INST.get(ChannelRepository.class).get(ctx.channel());
+        // A SUBSCRIBE can arrive on a channel that the channel repository does not
+        // know: the CONNECT may have failed, or the ownership of the client id may
+        // have been taken over by a newer connection. The session index is keyed by
+        // client id and rejects a null key, so the lookup is skipped instead of
+        // failing the whole SUBSCRIBE.
+        if (Objects.nonNull(clientId)) {
+            MqttSession session = Singleton.INST.get(SessionRepository.class).get(clientId);
+            if (Objects.nonNull(session)) {
+                mqttTopicSubscriptions.forEach(subscription -> session.addTopic(subscription.topicName(), subscription.qualityOfService()));
+            }
+        }
+
+        for (String ackTopic : ackTopics) {
+            byte[] message = Singleton.INST.get(TopicRepository.class).get(ackTopic);
+            if (Objects.nonNull(message)) {
+                sendSubMessage(ackTopic, message, packetId, channel);
+            }
+        }
+
+        sendSubAckMessage(packetId, ackSubscriptions, channel);
+    }
+
+    /**
+     * call back request of message.
+     * @param packetId packetId
+     * @param ackSubscriptions ackSubscriptions
+     * @param channel channel
+     */
+    private void sendSubAckMessage(final int packetId, final List<MqttTopicSubscription> ackSubscriptions, final Channel channel) {
+
+        List<Integer> qos = ackSubscriptions.stream()
+                .map(topicSub -> topicSub.qualityOfService().value())
+                .collect(Collectors.toList());
+
+        MqttFixedHeader fixedHeader = new MqttFixedHeader(MqttMessageType.SUBACK, false, AT_MOST_ONCE,
+                false, 0);
+        MqttSubAckPayload payload = new MqttSubAckPayload(qos);
+        MqttSubAckMessage mqttSubAckMessage = new MqttSubAckMessage(fixedHeader, from(packetId), payload);
+        channel.writeAndFlush(mqttSubAckMessage);
+    }
+
+    /**
+     * send subscribe message.
+     * @param topic topic
+     * @param message message
+     * @param packetId packetId
+     * @param channel channel
+     */
+    private void sendSubMessage(final String topic, final byte[] message, final int packetId, final Channel channel) {
+        MqttFixedHeader fixedHeader = new MqttFixedHeader(MqttMessageType.PUBLISH, false, AT_MOST_ONCE, true, 0);
+        MqttPublishVariableHeader varHeader = new MqttPublishVariableHeader(topic, packetId);
+        MqttPublishMessage mqttPublishMessage = new MqttPublishMessage(fixedHeader, varHeader, Unpooled.wrappedBuffer(message));
+        channel.writeAndFlush(mqttPublishMessage);
+    }
+}

@@ -1,0 +1,214 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.shenyu.plugin.httpclient;
+
+import org.apache.commons.lang3.StringUtils;
+import org.apache.shenyu.common.constant.Constants;
+import org.apache.shenyu.common.enums.PluginEnum;
+import org.apache.shenyu.common.enums.ResultEnum;
+import org.apache.shenyu.common.enums.UniqueHeaderEnum;
+import org.apache.shenyu.plugin.api.utils.HttpRouteDeadline;
+import org.apache.shenyu.plugin.api.utils.HttpRouteResponseHeaders;
+import org.apache.shenyu.plugin.base.utils.MediaTypeUtils;
+import org.apache.shenyu.plugin.httpclient.config.UpstreamPoolGroupRegistry;
+import org.apache.shenyu.plugin.httpclient.exception.ShenyuUpstreamStatusException;
+import org.springframework.core.io.buffer.DataBuffer;
+import org.springframework.core.io.buffer.DataBufferUtils;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpMethod;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
+import org.springframework.http.server.reactive.ServerHttpRequest;
+import org.springframework.web.reactive.function.client.WebClient;
+import org.springframework.web.server.ResponseStatusException;
+import org.springframework.web.server.ServerWebExchange;
+import org.reactivestreams.Subscription;
+import reactor.core.publisher.BaseSubscriber;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
+
+import java.net.URI;
+import java.util.Objects;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+/**
+ * The type Web client plugin.
+ */
+public class WebClientPlugin extends AbstractHttpClientPlugin<ResponseEntity<Flux<DataBuffer>>> {
+    
+    private final WebClient webClient;
+
+    private final UpstreamPoolGroupRegistry poolGroups;
+
+    private final int maxInMemorySize;
+
+    /**
+     * Instantiates a new Web client plugin.
+     *
+     * @param webClient the web client
+     * @deprecated use {@link #WebClientPlugin(WebClient, long)} to specify the replay cache cap
+     */
+    @Deprecated
+    public WebClientPlugin(final WebClient webClient) {
+        this(webClient, Constants.BYTES_PER_MB);
+    }
+
+    /**
+     * Instantiates a new Web client plugin.
+     *
+     * @param webClient the web client
+     * @param maxInMemorySize max request body size in bytes that may be cached for retry replay
+     */
+    public WebClientPlugin(final WebClient webClient, final long maxInMemorySize) {
+        this(webClient, maxInMemorySize, UpstreamPoolGroupRegistry.empty());
+    }
+
+    /**
+     * Instantiates a new Web client plugin.
+     *
+     * @param webClient the web client
+     * @param maxInMemorySize max request body size in bytes that may be cached for retry replay
+     * @param poolGroups the upstream pool group registry
+     */
+    public WebClientPlugin(final WebClient webClient, final long maxInMemorySize,
+                           final UpstreamPoolGroupRegistry poolGroups) {
+        super(maxInMemorySize);
+        this.webClient = webClient;
+        this.poolGroups = poolGroups;
+        this.maxInMemorySize = (int) Math.min(maxInMemorySize, Integer.MAX_VALUE);
+    }
+
+    /**
+     * Resolve the client for this request: the group WebClient when the divide rule handle
+     * selected a configured pool group, the shared default client otherwise.
+     *
+     * @param exchange the current exchange
+     * @return the WebClient to use
+     */
+    private WebClient resolveClient(final ServerWebExchange exchange) {
+        String group = exchange.getAttribute(Constants.HTTP_POOL_GROUP);
+        if (StringUtils.isBlank(group)) {
+            return webClient;
+        }
+        return poolGroups.webClientFor(group);
+    }
+    
+    @Override
+    protected Mono<ResponseEntity<Flux<DataBuffer>>> doRequest(final ServerWebExchange exchange, final String httpMethod,
+                                             final URI uri, final Flux<DataBuffer> body) {
+        // springWebflux5.3 mark #exchange() deprecated. because #echange maybe make memory leak.
+        // https://github.com/spring-projects/spring-framework/issues/25751
+        // exchange is deprecated, so change to {@link WebClient.RequestHeadersSpec#exchangeToMono(Function)}
+        ServerHttpRequest request = exchange.getRequest();
+        HttpMethod method = HttpMethod.valueOf(httpMethod);
+        final WebClient client;
+        try {
+            client = resolveClient(exchange);
+        } catch (IllegalStateException ex) {
+            return Mono.error(new ResponseStatusException(HttpStatus.SERVICE_UNAVAILABLE, ex.getMessage(), ex));
+        }
+        WebClient.RequestBodySpec requestBodySpec = client.method(method).uri(uri)
+                .headers(headers -> {
+                    headers.addAll(exchange.getRequest().getHeaders());
+                    this.duplicateHeaders(exchange, headers, UniqueHeaderEnum.REQ_UNIQUE_HEADER);
+                    headers.remove(HttpHeaders.HOST);
+                    Boolean preserveHost = exchange.getAttributeOrDefault(Constants.PRESERVE_HOST, Boolean.FALSE);
+                    if (preserveHost) {
+                        headers.add(HttpHeaders.HOST, request.getHeaders().getFirst(HttpHeaders.HOST));
+                    }
+                    // the headers of the client have been copied by now, so the trace context of the
+                    // gateway wins and the upstream continues the trace of the gateway span
+                    this.injectTraceContext(exchange, new HttpHeadersTraceContextCarrier(headers));
+                });
+        WebClient.RequestHeadersSpec<?> requestHeadersSpec = requestBodySpec;
+        // Do not attach a request body for GET/HEAD to avoid unexpected transfer encoding.
+        if (isRequestBodyRequired(httpMethod)) {
+            requestHeadersSpec = requestBodySpec.body((outputMessage, context) -> {
+                MediaType mediaType = exchange.getRequest().getHeaders().getContentType();
+                if (MediaTypeUtils.isByteType(mediaType)) {
+                    return outputMessage.writeWith(body);
+                }
+                // fix chinese garbled code
+                return outputMessage.writeWith(DataBufferUtils.join(body, maxInMemorySize));
+            });
+        }
+        final WebClient.ResponseSpec responseSpec = requestHeadersSpec
+                .retrieve()
+                .onRawStatus(httpStatus -> shouldFailover(exchange, httpStatus), clientResponse -> clientResponse.releaseBody()
+                        .thenReturn(new ShenyuUpstreamStatusException(clientResponse.statusCode().value())))
+                // cover DefaultResponseSpec#DEFAULT_STATUS_HANDLER
+                .onRawStatus(httpStatus -> httpStatus >= 400, clientResponse -> Mono.empty());
+        HttpRouteDeadline attempt = exchange.getAttribute(HttpRouteDeadline.ATTEMPT);
+        return responseSpec.toEntityFlux(DataBuffer.class)
+                .map(entity -> Objects.isNull(attempt) ? entity : ownResponse(entity, attempt))
+                .flatMap(fluxResponseEntity -> {
+                    if (fluxResponseEntity.getStatusCode().is2xxSuccessful()) {
+                        exchange.getAttributes().put(Constants.CLIENT_RESPONSE_RESULT_TYPE, ResultEnum.SUCCESS.getName());
+                    } else {
+                        exchange.getAttributes().put(Constants.CLIENT_RESPONSE_RESULT_TYPE, ResultEnum.ERROR.getName());
+                    }
+                    HttpRouteResponseHeaders.apply(exchange, () -> {
+                        HttpHeaders headers = exchange.getResponse().getHeaders();
+                        headers.putAll(fluxResponseEntity.getHeaders());
+                        this.duplicateHeaders(exchange, headers, UniqueHeaderEnum.RESP_UNIQUE_HEADER);
+                        exchange.getResponse().setStatusCode(fluxResponseEntity.getStatusCode());
+                    });
+                    exchange.getAttributes().put(Constants.CLIENT_RESPONSE_ATTR, fluxResponseEntity);
+                    return Mono.just(fluxResponseEntity);
+                });
+    }
+
+    private ResponseEntity<Flux<DataBuffer>> ownResponse(final ResponseEntity<Flux<DataBuffer>> entity, final HttpRouteDeadline attempt) {
+        Flux<DataBuffer> body = entity.getBody();
+        if (Objects.isNull(body)) {
+            attempt.received();
+            return entity;
+        }
+        AtomicBoolean claimed = new AtomicBoolean();
+        attempt.onAbandon(() -> {
+            if (claimed.compareAndSet(false, true)) {
+                // Headers arrived but the writer never subscribed. Cancel at subscription, without draining an unbounded body.
+                body.subscribe(new BaseSubscriber<>() {
+                    @Override
+                    protected void hookOnSubscribe(final Subscription subscription) {
+                        cancel();
+                    }
+                });
+            }
+        });
+        Flux<DataBuffer> owned = Flux.defer(() -> claimed.compareAndSet(false, true)
+                ? body.doOnComplete(attempt::received) : Flux.error(new IllegalStateException("HTTP response body already claimed")));
+        return new ResponseEntity<>(owned, entity.getHeaders(), entity.getStatusCode());
+    }
+
+    @Override
+    public int getOrder() {
+        return PluginEnum.WEB_CLIENT.getCode();
+    }
+    
+    @Override
+    public String named() {
+        return PluginEnum.WEB_CLIENT.getName();
+    }
+    
+    @Override
+    public boolean skip(final ServerWebExchange exchange) {
+        return skipExceptHttpLike(exchange);
+    }
+}

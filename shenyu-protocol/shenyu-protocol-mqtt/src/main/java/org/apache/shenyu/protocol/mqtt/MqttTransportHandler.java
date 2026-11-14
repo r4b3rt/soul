@@ -1,0 +1,74 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.shenyu.protocol.mqtt;
+
+import io.netty.channel.Channel;
+import io.netty.channel.ChannelFuture;
+import io.netty.channel.ChannelHandlerContext;
+import io.netty.channel.ChannelInboundHandlerAdapter;
+import io.netty.handler.codec.mqtt.MqttMessage;
+import io.netty.util.ReferenceCountUtil;
+import io.netty.util.concurrent.Future;
+import io.netty.util.concurrent.GenericFutureListener;
+import org.apache.shenyu.common.utils.Singleton;
+import org.apache.shenyu.protocol.mqtt.repositories.WillRepository;
+
+import java.util.Objects;
+
+/**
+ * mqtt transport handler.
+ */
+public class MqttTransportHandler extends ChannelInboundHandlerAdapter implements GenericFutureListener<Future<? super Void>> {
+
+    @Override
+    public void channelRead(final ChannelHandlerContext ctx, final Object msg) throws Exception {
+        try {
+            if (msg instanceof MqttMessage) {
+                MqttFactory mqttFactory = new MqttFactory((MqttMessage) msg, ctx);
+                mqttFactory.connect();
+            } else {
+                ctx.close();
+            }
+        } finally {
+            ReferenceCountUtil.release(msg);
+        }
+    }
+
+    @Override
+    public void channelInactive(final ChannelHandlerContext ctx) throws Exception {
+        final Channel channel = ctx.channel();
+
+        final WillRepository willRepository = Singleton.INST.get(WillRepository.class);
+        final WillRepository.WillEntry will = willRepository.get(channel);
+        if (Objects.nonNull(will)) {
+            // a will is published at most once; remove it before publishing so a repeated
+            // channelInactive cannot deliver it twice.
+            willRepository.remove(channel);
+            Publish.publishWill(will);
+        }
+        // release channel state before notifying the rest of the pipeline exactly once.
+        Disconnect.cleanChannel(ctx.channel());
+        ctx.fireChannelInactive();
+    }
+
+    @Override
+    public void operationComplete(final Future<? super Void> future) throws Exception {
+        Disconnect.cleanChannel(((ChannelFuture) future).channel());
+    }
+
+}

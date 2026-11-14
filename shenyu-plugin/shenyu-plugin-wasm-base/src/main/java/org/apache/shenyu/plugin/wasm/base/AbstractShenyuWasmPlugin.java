@@ -1,0 +1,204 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.shenyu.plugin.wasm.base;
+
+import com.dylibso.chicory.runtime.ExportFunction;
+import com.dylibso.chicory.runtime.Memory;
+import com.dylibso.chicory.runtime.Store;
+import org.apache.shenyu.common.dto.RuleData;
+import org.apache.shenyu.common.dto.SelectorData;
+import org.apache.shenyu.plugin.api.ShenyuPluginChain;
+import org.apache.shenyu.plugin.api.result.ShenyuResultEnum;
+import org.apache.shenyu.plugin.api.result.ShenyuResultWrap;
+import org.apache.shenyu.plugin.api.utils.WebFluxResultUtils;
+import org.apache.shenyu.plugin.base.AbstractShenyuPlugin;
+import org.apache.shenyu.plugin.wasm.api.loader.WasmLoader;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.http.HttpStatus;
+import org.springframework.web.server.ServerWebExchange;
+import reactor.core.publisher.Mono;
+import reactor.core.scheduler.Schedulers;
+
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+
+/**
+ * Complex plugins implemented in other languages should extend this class, we still need to write Java subclasses,
+ * so we can reuse the convenient/powerful control of ShenYu, such as {@link #getOrder}/{@link #skip}
+ * /{@link #skipExcept}/{@link #skipExceptHttpLike}.
+ *
+ * @see org.apache.shenyu.plugin.base.AbstractShenyuPlugin
+ * @see org.apache.shenyu.plugin.wasm.api.loader.WasmLoader
+ */
+public abstract class AbstractShenyuWasmPlugin extends AbstractShenyuPlugin implements AutoCloseable {
+
+    protected static final Logger LOG = LoggerFactory.getLogger(AbstractShenyuWasmPlugin.class);
+
+    protected static final Map<Long, Argument> ARGUMENTS = new ConcurrentHashMap<>();
+
+    protected static final String DO_EXECUTE_METHOD_NAME = "doExecute";
+
+    protected static final String BEFORE_METHOD_NAME = "before";
+
+    protected static final String AFTER_METHOD_NAME = "after";
+
+    private final WasmLoader wasmLoader;
+
+    public AbstractShenyuWasmPlugin() {
+        // Pass null initializer so WasmLoader registers built-in get_args/put_result
+        // and calls its own initWasmCallJavaFunc (no-op by default).
+        // Subclasses that need custom host functions should use
+        // AbstractShenyuWasmPlugin(Consumer<Store>) constructor.
+        this.wasmLoader = new WasmLoader(this.getClass(), null);
+    }
+
+    /**
+     * Constructor accepting a custom initializer for advanced use cases where
+     * the default built-in host functions ({@code get_args}/{@code put_result})
+     * are not sufficient. When using this constructor, the initializer is
+     * responsible for registering all required host functions.
+     *
+     * @param initializer consumer to register host functions on the Chicory Store
+     */
+    public AbstractShenyuWasmPlugin(final java.util.function.Consumer<Store> initializer) {
+        this.wasmLoader = new WasmLoader(this.getClass(), initializer);
+    }
+
+    /**
+     * Get the WASM module's linear memory for use in host functions.
+     *
+     * @return the Memory instance
+     */
+    public Memory getMemory() {
+        return wasmLoader.getMemory();
+    }
+
+    @Override
+    public void close() {
+        wasmLoader.close();
+    }
+
+    @Override
+    protected Mono<Void> doExecute(final ServerWebExchange exchange,
+                                   final ShenyuPluginChain chain,
+                                   final SelectorData selector,
+                                   final RuleData rule) {
+        if (wasmLoader.hasExecutionDeadline()) {
+            return Mono.defer(() -> executeWasm(exchange, chain, selector, rule)).subscribeOn(Schedulers.boundedElastic());
+        }
+        return executeWasm(exchange, chain, selector, rule);
+    }
+
+    /**
+     * this is Template Method child has implements your own logic.
+     *
+     * @param exchange   exchange the current server exchange {@linkplain ServerWebExchange}
+     * @param chain      chain the current chain  {@linkplain ServerWebExchange}
+     * @param selector   selector    {@linkplain SelectorData}
+     * @param rule       rule    {@linkplain RuleData}
+     * @param argumentId the argument id {@linkplain #getArgumentId}
+     * @return {@code Mono<Void>} to indicate when request handling is complete
+     */
+    protected abstract Mono<Void> doExecute(ServerWebExchange exchange, ShenyuPluginChain chain, SelectorData selector, RuleData rule, Long argumentId);
+
+    private Mono<Void> executeWasm(final ServerWebExchange exchange, final ShenyuPluginChain chain,
+                                   final SelectorData selector, final RuleData rule) {
+        return wasmLoader.getWasmExtern(DO_EXECUTE_METHOD_NAME).map(doExecute -> {
+            final Long argumentId = callWASI(exchange, chain, selector, rule, doExecute);
+            return doExecute(exchange, chain, selector, rule, argumentId);
+        }).orElseGet(() -> {
+            LOG.error("{} function not found in {}", DO_EXECUTE_METHOD_NAME, wasmLoader.getWasmName());
+            exchange.getResponse().setStatusCode(HttpStatus.INTERNAL_SERVER_ERROR);
+            Object error = ShenyuResultWrap.error(exchange, ShenyuResultEnum.WASM_FUNC_NOT_FOUND);
+            return WebFluxResultUtils.result(exchange, error);
+        });
+    }
+
+    private Long callWASI(final ServerWebExchange exchange,
+                          final ShenyuPluginChain chain,
+                          final SelectorData selector,
+                          final RuleData rule,
+                          final ExportFunction doExecute) {
+        // WASI cannot easily pass Java objects like JNI, here we pass Long as arg
+        // then we can get the argument by Long
+        final Long argumentId = getArgumentId(exchange, chain, selector, rule);
+        ARGUMENTS.put(argumentId, new Argument(exchange, chain, selector, rule));
+        // call WASI function
+        try {
+            doExecute.apply(argumentId);
+        } finally {
+            ARGUMENTS.remove(argumentId);
+        }
+        return argumentId;
+    }
+
+    protected abstract Long getArgumentId(ServerWebExchange exchange,
+                                          ShenyuPluginChain chain,
+                                          SelectorData selector,
+                                          RuleData rule);
+
+    @Override
+    public void before(final ServerWebExchange exchange) {
+        wasmLoader.getWasmExtern(BEFORE_METHOD_NAME)
+                .ifPresent(before -> callWASI(exchange, null, null, null, before));
+    }
+
+    @Override
+    public void after(final ServerWebExchange exchange) {
+        wasmLoader.getWasmExtern(AFTER_METHOD_NAME)
+                .ifPresent(before -> callWASI(exchange, null, null, null, before));
+    }
+
+    protected static final class Argument {
+
+        private final ServerWebExchange exchange;
+
+        private final ShenyuPluginChain chain;
+
+        private final SelectorData selector;
+
+        private final RuleData rule;
+
+        private Argument(final ServerWebExchange exchange,
+                         final ShenyuPluginChain chain,
+                         final SelectorData selector,
+                         final RuleData rule) {
+            this.exchange = exchange;
+            this.chain = chain;
+            this.selector = selector;
+            this.rule = rule;
+        }
+
+        public ServerWebExchange getExchange() {
+            return exchange;
+        }
+
+        public ShenyuPluginChain getChain() {
+            return chain;
+        }
+
+        public SelectorData getSelector() {
+            return selector;
+        }
+
+        public RuleData getRule() {
+            return rule;
+        }
+    }
+}

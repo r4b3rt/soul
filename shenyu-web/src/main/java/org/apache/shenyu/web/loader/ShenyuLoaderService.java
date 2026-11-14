@@ -1,0 +1,132 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.shenyu.web.loader;
+
+import org.apache.commons.collections4.CollectionUtils;
+import org.apache.shenyu.common.concurrent.ShenyuThreadFactory;
+import org.apache.shenyu.common.config.ShenyuConfig;
+import org.apache.shenyu.common.config.ShenyuConfig.ExtPlugin;
+import org.apache.shenyu.common.dto.PluginData;
+import org.apache.shenyu.plugin.api.ShenyuPlugin;
+import org.apache.shenyu.plugin.base.cache.CommonPluginDataSubscriber;
+import org.apache.shenyu.plugin.base.handler.PluginDataHandler;
+import org.apache.shenyu.web.handler.ShenyuWebHandler;
+import org.apache.shenyu.web.loader.ShenyuExtPathPluginJarLoader.ExtPluginLoadResult;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.File;
+import java.util.Base64;
+import java.util.List;
+import java.util.Objects;
+import java.util.Set;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
+
+/**
+ * The type Shenyu loader service.
+ */
+public class ShenyuLoaderService {
+
+    private static final Logger LOG = LoggerFactory.getLogger(ShenyuLoaderService.class);
+
+    private final ShenyuWebHandler webHandler;
+
+    private final CommonPluginDataSubscriber subscriber;
+
+    private final ShenyuConfig shenyuConfig;
+
+    /**
+     * Instantiates a new Shenyu loader service.
+     *
+     * @param webHandler   the web handler
+     * @param subscriber   the subscriber
+     * @param shenyuConfig the shenyu config
+     */
+    public ShenyuLoaderService(final ShenyuWebHandler webHandler, final CommonPluginDataSubscriber subscriber, final ShenyuConfig shenyuConfig) {
+        this.subscriber = subscriber;
+        this.webHandler = webHandler;
+        this.shenyuConfig = shenyuConfig;
+        ExtPlugin config = shenyuConfig.getExtPlugin();
+        if (config.getEnabled()) {
+            File extPluginPathDir = ShenyuPluginPathBuilder.getPluginFile(shenyuConfig.getExtPlugin().getPath());
+            LOG.info("shenyu extPlugin path: {}", extPluginPathDir.getAbsolutePath());
+
+            ScheduledThreadPoolExecutor executor = new ScheduledThreadPoolExecutor(config.getThreads(), ShenyuThreadFactory.create("plugin-ext-loader", true));
+            executor.scheduleAtFixedRate(() -> loadExtOrUploadPlugins(null), config.getScheduleDelay(), config.getScheduleTime(), TimeUnit.SECONDS);
+        }
+    }
+
+    /**
+     * loadPlugin from ext-lib or admin upload jar.
+     *
+     * @param uploadedJarResource uploadedJarResource is null load ext-lib,not null load admin upload jar
+     */
+    public void loadExtOrUploadPlugins(final PluginData uploadedJarResource) {
+        try {
+            ShenyuPluginClassLoaderHolder singleton = ShenyuPluginClassLoaderHolder.getSingleton();
+            if (Objects.isNull(uploadedJarResource)) {
+                ExtPluginLoadResult loadResult = ShenyuExtPathPluginJarLoader.loadExtendPlugins(shenyuConfig.getExtPlugin().getPath(), this::unloadPlugins);
+                for (PluginJarParser.PluginJar extPath : loadResult.getPluginJars()) {
+                    LOG.info("shenyu extPlugin find new {} to load", extPath.getAbsolutePath());
+                    singleton.replacePluginClassLoader(extPath, this::loadAndActivatePlugins, this::unloadPlugins);
+                }
+            } else {
+                PluginJarParser.PluginJar pluginJar = PluginJarParser.parseJar(Base64.getDecoder().decode(uploadedJarResource.getPluginJar()));
+                LOG.info("shenyu upload plugin jar find new {} to load", pluginJar.getJarKey());
+                singleton.replacePluginClassLoader(pluginJar, this::loadAndActivatePlugins, this::unloadPlugins);
+            }
+        } catch (Exception e) {
+            LOG.error("shenyu plugins load has error ", e);
+        }
+    }
+
+    private void loadAndActivatePlugins(final ShenyuPluginClassLoader classLoader) {
+        List<ShenyuLoaderResult> plugins = classLoader.loadUploadedJarPlugins();
+        if (CollectionUtils.isEmpty(plugins)) {
+            throw new IllegalStateException("No plugin was loaded from the candidate jar");
+        }
+        loaderPlugins(plugins);
+    }
+
+    private void unloadPlugins(final ShenyuPluginClassLoader classLoader) {
+        webHandler.removeExtPluginsByClassLoader(classLoader);
+        subscriber.removeExtendPluginDataHandlers(classLoader);
+    }
+
+    /**
+     * loaderPlugins.
+     *
+     * @param results results
+     */
+    private void loaderPlugins(final List<ShenyuLoaderResult> results) {
+        if (CollectionUtils.isEmpty(results)) {
+            return;
+        }
+        List<ShenyuPlugin> shenyuExtendPlugins = results.stream().map(ShenyuLoaderResult::getShenyuPlugin).filter(Objects::nonNull).collect(Collectors.toList());
+        List<PluginDataHandler> handlers = results.stream().map(ShenyuLoaderResult::getPluginDataHandler).filter(Objects::nonNull).collect(Collectors.toList());
+        Set<String> handlerNames = handlers.stream().map(PluginDataHandler::pluginNamed).collect(Collectors.toSet());
+        Set<String> pluginsWithoutHandlers = shenyuExtendPlugins.stream().map(ShenyuPlugin::named)
+                .filter(name -> !handlerNames.contains(name)).collect(Collectors.toSet());
+        webHandler.putExtPlugins(shenyuExtendPlugins);
+        subscriber.removeExtendPluginDataHandlers(pluginsWithoutHandlers);
+        subscriber.putExtendPluginDataHandler(handlers);
+    }
+
+}

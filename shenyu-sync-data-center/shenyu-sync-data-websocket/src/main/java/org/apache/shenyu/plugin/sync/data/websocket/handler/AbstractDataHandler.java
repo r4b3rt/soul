@@ -1,0 +1,120 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.shenyu.plugin.sync.data.websocket.handler;
+
+import java.util.Collections;
+import java.util.List;
+
+import org.apache.commons.collections4.CollectionUtils;
+import org.apache.shenyu.common.enums.DataEventTypeEnum;
+
+/**
+ * The type Abstract data handler.
+ *
+ * @param <T> the type parameter
+ */
+public abstract class AbstractDataHandler<T> implements DataHandler {
+
+    /**
+     * Convert list.
+     *
+     * @param json the json
+     * @return the list
+     */
+    protected abstract List<T> convert(String json);
+
+    /**
+     * Do refresh.
+     *
+     * @param dataList the data list
+     */
+    protected abstract void doRefresh(List<T> dataList);
+
+    /**
+     * Do a refresh scoped to the payload when the group supports it; the default
+     * keeps the legacy whole-group refresh.
+     *
+     * @param dataList the data list
+     */
+    protected void doScopedRefresh(final List<T> dataList) {
+        doRefresh(dataList);
+    }
+
+    /**
+     * Do update.
+     *
+     * @param dataList the data list
+     */
+    protected abstract void doUpdate(List<T> dataList);
+
+    /**
+     * Do delete.
+     *
+     * @param dataList the data list
+     */
+    protected abstract void doDelete(List<T> dataList);
+
+    /**
+     * Apply an authoritative snapshot for the connection's namespace.
+     * @param json snapshot array, including an empty array
+     * @param namespaceId namespace to replace
+     */
+    public void handleSnapshot(final String json, final String namespaceId) {
+        List<T> dataList = convert(json);
+        if (java.util.Objects.isNull(dataList)) {
+            throw new IllegalArgumentException("A snapshot must contain a data array");
+        }
+        doSnapshot(dataList, namespaceId);
+    }
+
+    /**
+     * Replace the complete group, not just rows present in the payload.
+     * @param dataList complete group
+     * @param namespaceId namespace to replace
+     */
+    protected void doSnapshot(final List<T> dataList, final String namespaceId) {
+        throw new IllegalArgumentException("Namespace snapshots are supported only for plugins, selectors and rules");
+    }
+
+    @Override
+    public void handle(final String json, final String eventType) {
+        List<T> dataList = convert(json);
+        DataEventTypeEnum eventTypeEnum = DataEventTypeEnum.acquireByName(eventType);
+        switch (eventTypeEnum) {
+            case MYSELF:
+                doRefresh(CollectionUtils.isEmpty(dataList) ? Collections.emptyList() : dataList);
+                break;
+            case REFRESH:
+                doScopedRefresh(CollectionUtils.isEmpty(dataList) ? Collections.emptyList() : dataList);
+                break;
+            case UPDATE:
+            case CREATE:
+                if (CollectionUtils.isNotEmpty(dataList)) {
+                    doUpdate(dataList);
+                }
+                break;
+            case DELETE:
+                if (CollectionUtils.isNotEmpty(dataList)) {
+                    doDelete(dataList);
+                }
+                break;
+            default:
+                break;
+        }
+    }
+}

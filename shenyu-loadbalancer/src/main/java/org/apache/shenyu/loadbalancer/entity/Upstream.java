@@ -1,0 +1,897 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.shenyu.loadbalancer.entity;
+
+import org.apache.commons.lang3.StringUtils;
+
+import java.util.Collections;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
+
+/**
+ * this is upstream.
+ */
+public final class Upstream {
+
+    private static final String DEFAULT_PROTOCOL = "http://";
+
+    /**
+     * protocol.
+     */
+    private final String protocol;
+
+    /**
+     * Normalized protocol prefix, computed once because the protocol is immutable.
+     */
+    private final transient String protocolPrefix;
+
+    /**
+     * url.
+     */
+    private String url;
+
+    /**
+     * One selector-scoped domain key, bounded by this upstream's lifetime.
+     */
+    private transient volatile SelectorKey selectorKey;
+
+    /**
+     * weight.
+     */
+    private int weight;
+
+    /**
+     * false close, true open.
+     */
+    private boolean status;
+
+    /**
+     * startup time.
+     */
+    private final long timestamp;
+
+    /**
+     * warmup.
+     */
+    private final int warmup;
+
+    /**
+     * healthy.
+     */
+    private boolean healthy;
+
+    /**
+     * lastHealthTimestamp.
+     */
+    private long lastHealthTimestamp;
+
+    /**
+     * lastUnhealthyTimestamp.
+     */
+    private long lastUnhealthyTimestamp;
+
+    /**
+     * group.
+     */
+    private String group;
+
+    /**
+     * version.
+     */
+    private String version;
+
+    private transient UpstreamIdentity identity;
+
+    /**
+     * ewma value.
+     */
+    private long lag;
+
+    /**
+     * response stamp.
+     */
+    private long responseStamp;
+
+    /**
+     * Last selected timestamp.
+     */
+    private long lastPicked;
+
+    /**
+     * this is gray.
+     */
+    private volatile boolean gray;
+
+    /**
+     * health check enabled.
+     */
+    private boolean healthCheckEnabled = true;
+
+    /**
+     * draining: alive, but excluded from new selections (#8042).
+     */
+    private volatile boolean draining;
+
+    /**
+     * ready: alive and ready to receive new work; false excludes new selections (#8042).
+     */
+    private volatile boolean ready = true;
+    
+    private volatile Map<String, String> labels = Collections.emptyMap();
+
+    private volatile Map<String, String> metadata = new ConcurrentHashMap<>();
+    
+    
+    /**
+     * Total number of requests being processed.
+     */
+    private AtomicLong inflight = new AtomicLong(1);
+
+    private final AtomicLong succeeded = new AtomicLong(0);
+
+    private final AtomicLong succeededElapsed = new AtomicLong(0);
+
+    private Upstream(final Builder builder) {
+        this.protocol = builder.protocol;
+        this.protocolPrefix = normalizeProtocol(builder.protocol);
+        this.url = builder.url;
+        this.weight = builder.weight;
+        this.status = builder.status;
+        this.timestamp = builder.timestamp;
+        this.warmup = builder.warmup;
+        this.group = builder.group;
+        this.version = builder.version;
+        this.gray = builder.gray;
+        this.healthCheckEnabled = builder.healthCheckEnabled;
+        this.draining = builder.draining;
+        this.ready = builder.ready;
+    }
+    
+    /**
+     * Gets upstream labels independently of scalar metadata.
+     *
+     * @return immutable upstream labels
+     */
+    public Map<String, String> getLabels() {
+        return labels;
+    }
+
+    /**
+     * Sets an immutable snapshot of upstream labels.
+     *
+     * @param labels upstream labels
+     */
+    public void setLabels(final Map<String, String> labels) {
+        this.labels = Map.copyOf(labels);
+    }
+
+    /**
+     * Gets protocol.
+     *
+     * @return the protocol
+     */
+    public String getProtocol() {
+        return protocol;
+    }
+    
+    /**
+     * Is status boolean.
+     *
+     * @return the boolean
+     */
+    public boolean isStatus() {
+        return status;
+    }
+    
+    /**
+     * Sets status.
+     *
+     * @param status the status
+     */
+    public void setStatus(final boolean status) {
+        this.status = status;
+    }
+    
+    /**
+     * Gets timestamp.
+     *
+     * @return the timestamp
+     */
+    public long getTimestamp() {
+        return timestamp;
+    }
+    
+    /**
+     * Gets warmup.
+     *
+     * @return the warmup
+     */
+    public int getWarmup() {
+        return warmup;
+    }
+    
+    /**
+     * Gets url.
+     *
+     * @return the url
+     */
+    public String getUrl() {
+        return url;
+    }
+    
+    /**
+     * Sets url.
+     *
+     * @param url the url
+     */
+    public void setUrl(final String url) {
+        this.url = url;
+        this.selectorKey = null;
+        this.identity = null;
+    }
+    
+    /**
+     * get weight.
+     *
+     * @return weight weight
+     */
+    public int getWeight() {
+        return weight;
+    }
+    
+    /**
+     * Sets weight.
+     *
+     * @param weight the weight
+     */
+    public void setWeight(final int weight) {
+        this.weight = weight;
+    }
+    
+    /**
+     * Is healthy boolean.
+     *
+     * @return the boolean
+     */
+    public boolean isHealthy() {
+        return healthy;
+    }
+    
+    /**
+     * Sets healthy.
+     *
+     * @param healthy the healthy
+     */
+    public void setHealthy(final boolean healthy) {
+        this.healthy = healthy;
+    }
+
+    /**
+     * Is health check enabled.
+     *
+     * @return the boolean
+     */
+    public boolean isHealthCheckEnabled() {
+        return healthCheckEnabled;
+    }
+
+    /**
+     * Sets health check enabled.
+     *
+     * @param healthCheckEnabled the health check enabled
+     */
+    public void setHealthCheckEnabled(final boolean healthCheckEnabled) {
+        this.healthCheckEnabled = healthCheckEnabled;
+    }
+
+    /**
+     * Whether the upstream is draining: alive but excluded from new selections.
+     *
+     * @return the draining
+     */
+    public boolean isDraining() {
+        return draining;
+    }
+
+    /**
+     * Sets draining.
+     *
+     * @param draining the draining
+     */
+    public void setDraining(final boolean draining) {
+        this.draining = draining;
+    }
+
+    /**
+     * Whether the upstream is ready to receive new work.
+     *
+     * @return the ready
+     */
+    public boolean isReady() {
+        return ready;
+    }
+
+    /**
+     * Sets ready.
+     *
+     * @param ready the ready
+     */
+    public void setReady(final boolean ready) {
+        this.ready = ready;
+    }
+    
+    /**
+     * Gets last health timestamp.
+     *
+     * @return the last health timestamp
+     */
+    public long getLastHealthTimestamp() {
+        return lastHealthTimestamp;
+    }
+    
+    /**
+     * Sets last health timestamp.
+     *
+     * @param lastHealthTimestamp the last health timestamp
+     */
+    public void setLastHealthTimestamp(final long lastHealthTimestamp) {
+        this.lastHealthTimestamp = lastHealthTimestamp;
+    }
+    
+    /**
+     * Gets last unhealthy timestamp.
+     *
+     * @return the last unhealthy timestamp
+     */
+    public long getLastUnhealthyTimestamp() {
+        return lastUnhealthyTimestamp;
+    }
+    
+    /**
+     * Sets last unhealthy timestamp.
+     *
+     * @param lastUnhealthyTimestamp the last unhealthy timestamp
+     */
+    public void setLastUnhealthyTimestamp(final long lastUnhealthyTimestamp) {
+        this.lastUnhealthyTimestamp = lastUnhealthyTimestamp;
+    }
+    
+    /**
+     * Gets group.
+     *
+     * @return the group
+     */
+    public String getGroup() {
+        return group;
+    }
+    
+    /**
+     * Sets group.
+     *
+     * @param group the group
+     */
+    public void setGroup(final String group) {
+        this.group = group;
+        this.identity = null;
+    }
+    
+    /**
+     * Gets version.
+     *
+     * @return the version
+     */
+    public String getVersion() {
+        return version;
+    }
+    
+    /**
+     * Sets version.
+     *
+     * @param version the version
+     */
+    public void setVersion(final String version) {
+        this.version = version;
+        this.identity = null;
+    }
+    
+    /**
+     * Gets lag.
+     *
+     * @return the lag
+     */
+    public long getLag() {
+        return lag;
+    }
+    
+    /**
+     * Sets lag.
+     *
+     * @param lag the lag
+     */
+    public void setLag(final long lag) {
+        this.lag = lag;
+    }
+    
+    /**
+     * Gets responseStamp.
+     *
+     * @return the responseStamp
+     */
+    public long getResponseStamp() {
+        return responseStamp;
+    }
+    
+    /**
+     * Sets responseStamp.
+     *
+     * @param responseStamp the responseStamp
+     */
+    public void setResponseStamp(final long responseStamp) {
+        this.responseStamp = responseStamp;
+    }
+    
+    /**
+     * Gets lastPickedStamp.
+     *
+     * @return the lastPickedStamp
+     */
+    public long getLastPicked() {
+        return lastPicked;
+    }
+    
+    /**
+     * Sets lastPickedStamp.
+     *
+     * @param lastPicked the lastPickedStamp
+     */
+    public void setLastPicked(final long lastPicked) {
+        this.lastPicked = lastPicked;
+    }
+    
+    /**
+     * Gets inflight.
+     *
+     * @return the inflight
+     */
+    public AtomicLong getInflight() {
+        return inflight;
+    }
+    
+    /**
+     * Sets inflight.
+     *
+     * @param inflight the inflight
+     */
+    public void setInflight(final AtomicLong inflight) {
+        this.inflight = inflight;
+    }
+    
+    /**
+     * gray.
+     *
+     * @return Gray boolean
+     */
+    public boolean isGray() {
+        return gray;
+    }
+    
+    /**
+     * set gray.
+     *
+     * @param gray gray
+     */
+    public void setGray(final boolean gray) {
+        this.gray = gray;
+    }
+    
+    /**
+     * Gets metadata.
+     *
+     * @return the metadata
+     */
+    public Map<String, String> getMetadata() {
+        return metadata;
+    }
+    
+    /**
+     * Sets metadata.
+     *
+     * @param metadata the metadata
+     */
+    public void setMetadata(final Map<String, String> metadata) {
+        this.metadata = metadata;
+    }
+    
+    /**
+     * Gets succeeded.
+     *
+     * @return the succeeded
+     */
+    public AtomicLong getSucceeded() {
+        return succeeded;
+    }
+    
+    /**
+     * Gets succeededElapsed.
+     *
+     * @return the succeededElapsed
+     */
+    public AtomicLong getSucceededElapsed() {
+        return succeededElapsed;
+    }
+    
+    /**
+     * Gets succeededAverageElapsed.
+     *
+     * @return the succeededAverageElapsed.
+     */
+    public long getSucceededAverageElapsed() {
+        long succeeded = getSucceeded().get();
+        if (succeeded == 0) {
+            return 0;
+        }
+        return getSucceededElapsed().get() / succeeded;
+    }
+    
+    /**
+     * build request domain.
+     *
+     * @return domain string
+     */
+    public String buildDomain() {
+        return protocolPrefix + Optional.ofNullable(this.getUrl()).map(String::trim).orElse(null);
+    }
+
+    /**
+     * Build request with protocol.
+     *
+     * @param protocol protocol
+     * @return domain string
+     */
+    public String buildDomain(final String protocol) {
+        return normalizeProtocol(protocol) + Optional.ofNullable(this.getUrl()).map(String::trim).orElse(null);
+    }
+
+    /**
+     * Build a selector-scoped domain key without request-time concatenation.
+     *
+     * <p>Only one immutable entry is retained per upstream. Sharing an upstream
+     * between selectors replaces that entry, and URL changes invalidate it.
+     * Weight, group and version do not change the domain key.
+     *
+     * @param selectorId the selector id
+     * @return the selector id and current request domain separated by a colon
+     */
+    public String buildSelectorKey(final String selectorId) {
+        SelectorKey cached = selectorKey;
+        String currentUrl = url;
+        if (Objects.nonNull(cached) && Objects.equals(cached.selectorId, selectorId) && Objects.equals(cached.url, currentUrl)) {
+            return cached.key;
+        }
+        String domain = protocolPrefix + (Objects.isNull(currentUrl) ? null : currentUrl.trim());
+        SelectorKey updated = new SelectorKey(selectorId, currentUrl, selectorId + ":" + domain);
+        selectorKey = updated;
+        return updated.key;
+    }
+
+    /**
+     * Normalize a protocol value to a url prefix, so a bare scheme such as {@code http}
+     * cannot be concatenated directly with the upstream address.
+     *
+     * @param protocol protocol
+     * @return the normalized protocol, always ending with {@code ://}
+     */
+    private static String normalizeProtocol(final String protocol) {
+        if (StringUtils.isBlank(protocol)) {
+            return DEFAULT_PROTOCOL;
+        }
+        String scheme = StringUtils.stripEnd(StringUtils.stripEnd(protocol.trim(), "/"), ":");
+        if (scheme.isEmpty()) {
+            return DEFAULT_PROTOCOL;
+        }
+        return scheme + "://";
+    }
+    
+    /**
+     * class builder.
+     *
+     * @return Builder builder
+     */
+    public static Builder builder() {
+        return new Builder();
+    }
+
+    /**
+     * Get the current immutable logical target identity.
+     *
+     * @return the logical target identity
+     */
+    public UpstreamIdentity identity() {
+        if (Objects.isNull(identity)) {
+            identity = new UpstreamIdentity(protocol, url, group, version, buildDomain());
+        }
+        return identity;
+    }
+
+    @Override
+    public boolean equals(final Object o) {
+        if (this == o) {
+            return true;
+        }
+        if (Objects.isNull(o) || getClass() != o.getClass()) {
+            return false;
+        }
+        Upstream that = (Upstream) o;
+        return identity().equals(that.identity());
+    }
+
+    @Override
+    public int hashCode() {
+        return identity().hashCode();
+    }
+
+    @Override
+    public String toString() {
+        return "Upstream{"
+                + "protocol='" + protocol
+                + ", url='" + url
+                + ", weight=" + weight
+                + ", status=" + status
+                + ", timestamp=" + timestamp
+                + ", warmup=" + warmup
+                + ", group='" + group
+                + ", version='" + version
+                + '}';
+    }
+    
+    /**
+     * Immutable selector-scoped domain cache entry.
+     */
+    private static final class SelectorKey {
+
+        private final String selectorId;
+
+        private final String url;
+
+        private final String key;
+
+        private SelectorKey(final String selectorId, final String url, final String key) {
+            this.selectorId = selectorId;
+            this.url = url;
+            this.key = key;
+        }
+    }
+
+    /**
+     * Class builder.
+     */
+    public static final class Builder {
+
+        /**
+         * protocol.
+         */
+        private String protocol;
+
+        /**
+         * url.
+         */
+        private String url;
+
+        /**
+         * weight.
+         */
+        private int weight = 50;
+
+        /**
+         * status.
+         */
+        private boolean status = true;
+
+        /**
+         * timestamp.
+         */
+        private long timestamp;
+
+        /**
+         * warmup.
+         */
+        private int warmup = 10 * 60 * 1000;
+
+        /**
+         * group.
+         */
+        private String group;
+
+        /**
+         * version.
+         */
+        private String version;
+
+        /**
+         * gray.
+         */
+        private Boolean gray = false;
+
+        /**
+         * health check enabled.
+         */
+        private boolean healthCheckEnabled = true;
+
+        /**
+         * draining.
+         */
+        private boolean draining;
+
+        /**
+         * ready.
+         */
+        private boolean ready = true;
+
+        /**
+         * no args constructor.
+         */
+        private Builder() {
+        }
+        
+        /**
+         * build new Object.
+         *
+         * @return Upstream upstream
+         */
+        public Upstream build() {
+            return new Upstream(this);
+        }
+        
+        /**
+         * build protocol.
+         *
+         * @param protocol protocol
+         * @return this builder
+         */
+        public Builder protocol(final String protocol) {
+            this.protocol = protocol;
+            return this;
+        }
+        
+        /**
+         * build url.
+         *
+         * @param url url
+         * @return this builder
+         */
+        public Builder url(final String url) {
+            this.url = url;
+            return this;
+        }
+        
+        /**
+         * build weight.
+         *
+         * @param weight weight
+         * @return this builder
+         */
+        public Builder weight(final int weight) {
+            this.weight = weight;
+            return this;
+        }
+        
+        /**
+         * build status.
+         *
+         * @param status status
+         * @return this builder
+         */
+        public Builder status(final boolean status) {
+            this.status = status;
+            return this;
+        }
+        
+        /**
+         * build timestamp.
+         *
+         * @param timestamp timestamp
+         * @return this builder
+         */
+        public Builder timestamp(final long timestamp) {
+            this.timestamp = timestamp;
+            return this;
+        }
+        
+        /**
+         * build warmup.
+         *
+         * @param warmup warmup
+         * @return this builder
+         */
+        public Builder warmup(final int warmup) {
+            this.warmup = warmup;
+            return this;
+        }
+        
+        /**
+         * build group.
+         *
+         * @param group group
+         * @return this builder
+         */
+        public Builder group(final String group) {
+            this.group = group;
+            return this;
+        }
+        
+        /**
+         * build version.
+         *
+         * @param version version
+         * @return this builder
+         */
+        public Builder version(final String version) {
+            this.version = version;
+            return this;
+        }
+        
+        
+        /**
+         * build gray.
+         *
+         * @param gray gray
+         * @return this builder
+         */
+        public Builder gray(final Boolean gray) {
+            this.gray = gray;
+            return this;
+        }
+
+        /**
+         * build healthCheckEnabled.
+         *
+         * @param healthCheckEnabled healthCheckEnabled
+         * @return this builder
+         */
+        public Builder healthCheckEnabled(final boolean healthCheckEnabled) {
+            this.healthCheckEnabled = healthCheckEnabled;
+            return this;
+        }
+
+        /**
+         * build draining.
+         *
+         * @param draining draining
+         * @return this builder
+         */
+        public Builder draining(final boolean draining) {
+            this.draining = draining;
+            return this;
+        }
+
+        /**
+         * build ready.
+         *
+         * @param ready ready
+         * @return this builder
+         */
+        public Builder ready(final boolean ready) {
+            this.ready = ready;
+            return this;
+        }
+
+    }
+}

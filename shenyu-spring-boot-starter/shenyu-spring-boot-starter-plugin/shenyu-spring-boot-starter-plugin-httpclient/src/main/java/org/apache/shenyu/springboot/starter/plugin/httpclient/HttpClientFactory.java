@@ -1,0 +1,367 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.shenyu.springboot.starter.plugin.httpclient;
+
+import io.netty.channel.ChannelOption;
+import io.netty.handler.ssl.util.InsecureTrustManagerFactory;
+import io.netty.handler.timeout.IdleStateHandler;
+import io.netty.handler.timeout.ReadTimeoutHandler;
+import io.netty.handler.timeout.WriteTimeoutHandler;
+import org.apache.commons.lang3.ArrayUtils;
+import org.apache.commons.lang3.StringUtils;
+import org.apache.shenyu.common.constant.Constants;
+import org.apache.shenyu.plugin.httpclient.config.DefaultUpstreamPoolGroupRegistry;
+import org.apache.shenyu.plugin.httpclient.config.HttpClientProperties;
+import org.apache.shenyu.plugin.httpclient.config.HttpClientProperties.Pool;
+import org.apache.shenyu.plugin.httpclient.config.UpstreamPoolGroupRegistry;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.config.AbstractFactoryBean;
+import org.springframework.boot.autoconfigure.web.ServerProperties;
+import org.springframework.boot.context.properties.PropertyMapper;
+import org.springframework.util.ClassUtils;
+import reactor.netty.http.Http11SslContextSpec;
+import reactor.netty.http.Http2SslContextSpec;
+import reactor.netty.http.HttpProtocol;
+import reactor.netty.http.client.HttpClient;
+import reactor.netty.resources.ConnectionProvider;
+import reactor.netty.resources.ConnectionProvider.Builder;
+import reactor.netty.resources.LoopResources;
+import reactor.netty.tcp.SslProvider;
+import reactor.netty.transport.ProxyProvider;
+
+import org.springframework.http.client.reactive.ReactorClientHttpConnector;
+import org.springframework.web.reactive.function.client.ExchangeStrategies;
+import org.springframework.web.reactive.function.client.WebClient;
+
+import java.security.cert.X509Certificate;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.TimeUnit;
+
+public class HttpClientFactory extends AbstractFactoryBean<HttpClient> {
+
+    /**
+     * Upper bound on the number of configured pool groups; startup fails fast beyond it.
+     */
+    public static final int MAX_POOL_GROUPS = 16;
+
+    private static final Logger LOG = LoggerFactory.getLogger(HttpClientFactory.class);
+
+    private final HttpClientProperties properties;
+
+    private final LoopResources loopResources;
+
+    private final ServerProperties serverProperties;
+
+    public HttpClientFactory(final HttpClientProperties httpClientProperties,
+                             final LoopResources loopResources,
+                             final ServerProperties serverProperties) {
+        this.properties = httpClientProperties;
+        this.loopResources = loopResources;
+        this.serverProperties = serverProperties;
+    }
+
+    @Override
+    public Class<?> getObjectType() {
+        return HttpClient.class;
+    }
+
+    @Override
+    protected void destroyInstance(final HttpClient instance) {
+        // This factory creates and owns the provider; shared providers must not be injected here.
+        instance.configuration().connectionProvider().dispose();
+    }
+
+    /**
+     * set http proxy.
+     * @param httpClient http client
+     * @param proxy proxy
+     * @return HttpClient
+     */
+    private HttpClient setHttpClientProxy(final HttpClient httpClient, final HttpClientProperties.Proxy proxy) {
+        return httpClient.proxy(proxySpec -> {
+            ProxyProvider.Builder builder = proxySpec
+                    .type(ProxyProvider.Proxy.HTTP)
+                    .host(proxy.getHost());
+            PropertyMapper map = PropertyMapper.get();
+            map.from(proxy::getPort).whenNonNull().to(builder::port);
+            map.from(proxy::getUsername).whenHasText()
+                    .to(builder::username);
+            map.from(proxy::getPassword).whenHasText()
+                    .to(password -> builder.password(s -> password));
+            map.from(proxy::getNonProxyHostsPattern).whenHasText()
+                    .to(builder::nonProxyHosts);
+        });
+    }
+
+    private void setSsl(final SslProvider.SslContextSpec sslContextSpec, final HttpClientProperties.Ssl ssl) {
+        SslProvider.ProtocolSslContextSpec clientSslContext = (serverProperties.getHttp2().isEnabled())
+                ? Http2SslContextSpec.forClient() : Http11SslContextSpec.forClient();
+        clientSslContext.configure(sslContextBuilder -> {
+            X509Certificate[] trustedX509Certificates = ssl.getTrustedX509CertificatesForTrustManager();
+            if (ArrayUtils.isNotEmpty(trustedX509Certificates)) {
+                sslContextBuilder.trustManager(trustedX509Certificates);
+            } else if (ssl.isUseInsecureTrustManager()) {
+                sslContextBuilder.trustManager(InsecureTrustManagerFactory.INSTANCE);
+            }
+            sslContextBuilder.keyManager(ssl.getKeyManagerFactory());
+        });
+        sslContextSpec.sslContext(clientSslContext)
+                .handshakeTimeout(ssl.getHandshakeTimeout())
+                .closeNotifyFlushTimeout(ssl.getCloseNotifyFlushTimeout())
+                .closeNotifyReadTimeout(ssl.getCloseNotifyReadTimeout());
+    }
+
+    @Override
+    protected HttpClient createInstance() {
+        // configure pool resources.
+        HttpClientProperties.Pool pool = properties.getPool();
+        ConnectionProvider connectionProvider = buildConnectionProvider(pool);
+        return configureClient(HttpClient.create(connectionProvider), pool);
+    }
+
+    private HttpClient configureClient(final HttpClient source, final Pool pool) {
+        HttpClient httpClient = source
+                .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, properties.getConnectTimeout());
+        if (pool.getType() != Pool.PoolType.DISABLED) {
+            httpClient = httpClient.mapConnect(HttpClientConnectionProvider::propagateCancellation);
+        }
+        Duration responseTimeout = properties.getResponseTimeout();
+        if (!responseTimeout.isZero() && !responseTimeout.isNegative()) {
+            httpClient = httpClient.responseTimeout(responseTimeout);
+        }
+        if (serverProperties.getHttp2().isEnabled()) {
+            httpClient = httpClient.protocol(HttpProtocol.HTTP11, HttpProtocol.H2);
+        }
+        HttpClientProperties.Proxy proxy = properties.getProxy();
+        if (StringUtils.isNotEmpty(proxy.getHost())) {
+            httpClient = setHttpClientProxy(httpClient, proxy);
+        }
+        httpClient = httpClient.doOnConnected(connection -> {
+            connection.addHandlerLast(new IdleStateHandler(properties.getReaderIdleTime(), properties.getWriterIdleTime(), properties.getAllIdleTime(), TimeUnit.MILLISECONDS));
+            connection.addHandlerLast(new WriteTimeoutHandler(properties.getWriteTimeout(), TimeUnit.MILLISECONDS));
+            if (properties.getReadTimeout() > 0) {
+                connection.addHandlerLast(new ReadTimeoutHandler(properties.getReadTimeout(), TimeUnit.MILLISECONDS));
+            }
+        });
+        if (Objects.nonNull(loopResources)) {
+            httpClient = httpClient.runOn(loopResources);
+        }
+        HttpClientProperties.Ssl ssl = properties.getSsl();
+        if (StringUtils.isNotEmpty(ssl.getKeyStorePath())
+                || ArrayUtils.isNotEmpty(ssl.getTrustedX509CertificatesForTrustManager())
+                || ssl.isUseInsecureTrustManager()) {
+            httpClient = httpClient.secure(sslContextSpec -> setSsl(sslContextSpec, ssl));
+        }
+        if (properties.isWiretap()) {
+            httpClient = httpClient.wiretap(true);
+        }
+        // Reuse connections by default. Tune the fixed pool's maxIdleTime below the upstream idle limit;
+        // keepAlive=false remains an escape hatch for stale-connection resets (reactor-netty#388).
+        return httpClient.keepAlive(properties.isKeepAlive());
+    }
+
+    /**
+     * Build the immutable registry of named upstream pool groups. Groups come only from
+     * this startup configuration: names must be unique and non-blank, the group count is
+     * bounded, and every group is validated before any provider is built, so an invalid
+     * configuration fails the startup instead of serving requests. With no groups
+     * configured the empty registry keeps the default shared-pool behaviour unchanged.
+     *
+     * @return the registry, empty when no groups are configured
+     */
+    public UpstreamPoolGroupRegistry buildGroupRegistry() {
+        List<Pool> groups = properties.getPoolGroups();
+        if (groups.isEmpty()) {
+            return UpstreamPoolGroupRegistry.empty();
+        }
+        if (groups.size() > MAX_POOL_GROUPS) {
+            throw new IllegalArgumentException("Too many upstream pool groups: " + groups.size() + ", limit is " + MAX_POOL_GROUPS);
+        }
+        validateGroups(groups);
+        boolean webClientStrategy = "webClient".equalsIgnoreCase(properties.getStrategy());
+        Map<String, HttpClient> clients = new LinkedHashMap<>();
+        Map<String, WebClient> webClients = new LinkedHashMap<>();
+        List<ConnectionProvider> providers = new ArrayList<>(groups.size());
+        try {
+            for (Pool group : groups) {
+                String key = normalizeGroupName(group.getName());
+                ConnectionProvider provider = buildConnectionProvider(group);
+                providers.add(provider);
+                HttpClient client = configureClient(HttpClient.create(provider), group);
+                clients.put(key, client);
+                if (webClientStrategy) {
+                    webClients.put(key, buildGroupWebClient(client));
+                }
+            }
+        } catch (RuntimeException failure) {
+            disposeOnFailure(providers, failure);
+            throw failure;
+        }
+        return new DefaultUpstreamPoolGroupRegistry(clients, webClients, providers);
+    }
+
+    private void validateGroups(final List<Pool> groups) {
+        Set<String> names = new HashSet<>(groups.size());
+        for (int i = 0; i < groups.size(); i++) {
+            Pool group = groups.get(i);
+            if (Objects.isNull(group)) {
+                throw new IllegalArgumentException("Upstream pool group " + i + " must not be null");
+            }
+            if (StringUtils.isBlank(group.getName())) {
+                throw new IllegalArgumentException("Upstream pool group " + i + " name must not be blank");
+            }
+            String key = normalizeGroupName(group.getName());
+            if (HttpClientProperties.DEFAULT_POOL_NAME.equals(key)) {
+                throw new IllegalArgumentException("Upstream pool group " + i + " name must differ from the default pool name '"
+                        + HttpClientProperties.DEFAULT_POOL_NAME + "'");
+            }
+            if (!names.add(key)) {
+                throw new IllegalArgumentException("Duplicate upstream pool group name: " + group.getName());
+            }
+            if (group.getType() != HttpClientProperties.Pool.PoolType.FIXED) {
+                throw new IllegalArgumentException("Upstream pool group '" + group.getName()
+                        + "' must use the FIXED pool type so its connection bound is finite");
+            }
+            if (Objects.isNull(group.getMaxConnections()) || group.getMaxConnections() <= 0) {
+                throw new IllegalArgumentException("Upstream pool group '" + group.getName()
+                        + "' maxConnections must be strictly positive");
+            }
+            if (Objects.isNull(group.getAcquireTimeout()) || group.getAcquireTimeout() < 0) {
+                throw new IllegalArgumentException("Upstream pool group '" + group.getName()
+                        + "' acquireTimeout must not be negative");
+            }
+            if (Objects.nonNull(group.getMaxPendingAcquires()) && group.getMaxPendingAcquires() <= 0) {
+                throw new IllegalArgumentException("Upstream pool group '" + group.getName()
+                        + "' maxPendingAcquires must be strictly positive or omitted");
+            }
+        }
+    }
+
+    private static String normalizeGroupName(final String name) {
+        return name.trim().toLowerCase(Locale.ROOT);
+    }
+
+    private static void disposeOnFailure(final List<ConnectionProvider> providers, final Throwable failure) {
+        for (ConnectionProvider provider : providers) {
+            try {
+                provider.dispose();
+            } catch (RuntimeException disposeFailure) {
+                failure.addSuppressed(disposeFailure);
+            }
+        }
+    }
+
+    private WebClient buildGroupWebClient(final HttpClient client) {
+        int maxInMemorySize = properties.getMaxInMemorySize() * Constants.BYTES_PER_MB;
+        return WebClient.builder()
+                .exchangeStrategies(ExchangeStrategies.builder()
+                        .codecs(codecs -> codecs.defaultCodecs().maxInMemorySize(maxInMemorySize))
+                        .build())
+                .clientConnector(new ReactorClientHttpConnector(client))
+                .build();
+    }
+
+    ConnectionProvider buildConnectionProvider(final HttpClientProperties.Pool pool) {
+        if (pool.getType() == HttpClientProperties.Pool.PoolType.DISABLED) {
+            return ConnectionProvider.newConnection();
+        } else {
+            if (pool.getMetrics() && !ClassUtils.isPresent("io.micrometer.core.instrument.Metrics", ClassUtils.getDefaultClassLoader())) {
+                throw new IllegalStateException("pool.metrics requires micrometer-core on the classpath");
+            }
+            ConnectionProvider.Builder builder = ConnectionProvider.builder(pool.getName());
+            if (pool.getType() == HttpClientProperties.Pool.PoolType.FIXED) {
+                // reactor remove fixed pool by fixed method from 0.9.4
+                // reason: https://github.com/reactor/reactor-netty/issues/1499 and https://github.com/reactor/reactor-netty/issues/1960
+                this.buildFixedConnectionPool(pool, builder);
+            } else {
+                // please see https://projectreactor.io/docs/netty/release/reference/index.html#_connection_pool_2
+                // reactor remove elastic pool by elastic method from 0.9.4
+                // reason: https://github.com/reactor/reactor-netty/issues/1499 and https://github.com/reactor/reactor-netty/issues/1960
+                this.buildElasticConnectionPool(pool, builder);
+            }
+            Optional.ofNullable(pool.getMaxIdleTime()).map(Duration::ofMillis).ifPresent(builder::maxIdleTime);
+            Optional.ofNullable(pool.getMaxLifeTime()).map(Duration::ofMillis).ifPresent(builder::maxLifeTime);
+            Optional.ofNullable(pool.getEvictionInterval()).map(Duration::ofMillis).ifPresent(builder::evictInBackground);
+            builder.metrics(pool.getMetrics());
+            ConnectionProvider provider = builder.build();
+            return new HttpClientConnectionProvider(provider, pool.getMetrics());
+        }
+    }
+
+    /**
+     * build fixed connection pool.
+     *
+     * @param pool    connection pool params
+     * @param builder connection provider builder
+     */
+    public void buildFixedConnectionPool(final Pool pool,
+                                         final Builder builder) {
+        if (Objects.isNull(pool.getMaxConnections()) || pool.getMaxConnections() <= 0) {
+            throw new IllegalArgumentException("Max Connections value must be strictly positive");
+        }
+        if (Objects.isNull(pool.getAcquireTimeout()) || pool.getAcquireTimeout() < 0) {
+            throw new IllegalArgumentException("Acquire Timeout value must be non-negative");
+        }
+        int pendingAcquireMaxCount = Optional.ofNullable(pool.getPendingAcquireMaxCount())
+                .orElseGet(() -> (int) Math.min(2L * pool.getMaxConnections(), Integer.MAX_VALUE));
+        if (pendingAcquireMaxCount != -1 && pendingAcquireMaxCount <= 0) {
+            throw new IllegalArgumentException("Pending Acquire Max Count must be positive or -1");
+        }
+        builder.maxConnections(pool.getMaxConnections())
+                .pendingAcquireTimeout(Duration.ofMillis(pool.getAcquireTimeout()))
+                .pendingAcquireMaxCount(pendingAcquireMaxCount);
+    }
+
+    /**
+     * Build a lazily allocated pool using the configured connection and acquisition limits.
+     * The ELASTIC name is retained for configuration compatibility; it no longer forces unbounded capacity.
+     *
+     * @param builder connection provider builder
+     */
+    public void buildElasticConnectionPool(final Builder builder) {
+        buildElasticConnectionPool(properties.getPool(), builder);
+    }
+
+    /**
+     * build elastic connection provider pool.
+     *
+     * @param pool    connection pool params
+     * @param builder connection provider builder
+     */
+    public void buildElasticConnectionPool(final Pool pool,
+                                           final Builder builder) {
+        // Both overloads enforce the limits of the supplied pool.
+        buildFixedConnectionPool(pool, builder);
+        int pendingAcquireMaxCount = Optional.ofNullable(pool.getPendingAcquireMaxCount())
+                .orElseGet(() -> (int) Math.min(2L * pool.getMaxConnections(), Integer.MAX_VALUE));
+        LOG.warn("HTTP pool type ELASTIC no longer implies unbounded capacity; effective maxConnections={}, "
+                        + "pendingAcquireMaxCount={}, acquireTimeout={}ms. Review capacity settings or use FIXED explicitly.",
+                pool.getMaxConnections(), pendingAcquireMaxCount, pool.getAcquireTimeout());
+    }
+
+}

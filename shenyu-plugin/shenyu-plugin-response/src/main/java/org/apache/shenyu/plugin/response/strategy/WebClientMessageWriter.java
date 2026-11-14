@@ -1,0 +1,223 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.shenyu.plugin.response.strategy;
+
+import com.google.common.collect.Lists;
+import org.apache.commons.lang3.StringUtils;
+import org.apache.shenyu.common.constant.Constants;
+import org.apache.shenyu.common.enums.HeaderUniqueStrategyEnum;
+import org.apache.shenyu.common.enums.RpcTypeEnum;
+import org.apache.shenyu.common.enums.UniqueHeaderEnum;
+import org.apache.shenyu.plugin.api.ShenyuPluginChain;
+import org.apache.shenyu.plugin.api.result.ShenyuResultEnum;
+import org.apache.shenyu.plugin.api.result.ShenyuResultWrap;
+import org.apache.shenyu.plugin.api.utils.HttpRouteDeadline;
+import org.apache.shenyu.plugin.api.utils.HttpRouteResponseHeaders;
+import org.apache.shenyu.plugin.api.utils.WebFluxResultUtils;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.core.io.buffer.DataBuffer;
+import org.springframework.core.io.buffer.DataBufferUtils;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpStatusCode;
+import org.springframework.http.ResponseEntity;
+import org.springframework.http.server.reactive.ServerHttpResponse;
+import org.springframework.web.server.ServerWebExchange;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
+
+import java.util.HashSet;
+import java.util.ArrayList;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.Set;
+import java.util.StringJoiner;
+import java.util.function.Consumer;
+import java.util.regex.Pattern;
+
+/**
+ * The type Web client message writer.
+ */
+public class WebClientMessageWriter implements MessageWriter {
+
+    private static final Logger LOG = LoggerFactory.getLogger(WebClientMessageWriter.class);
+
+    /**
+     * the common binary media type regex.
+     */
+    private static final Pattern COMMON_BIN_MEDIA_TYPE_PATTERN;
+
+    /**
+     * the cross headers.
+     */
+    private static final Set<String> CORS_HEADERS = new HashSet<>() {
+        {
+            add(HttpHeaders.ACCESS_CONTROL_ALLOW_METHODS);
+            add(HttpHeaders.ACCESS_CONTROL_MAX_AGE);
+            add(HttpHeaders.ACCESS_CONTROL_ALLOW_HEADERS);
+            add(HttpHeaders.ACCESS_CONTROL_EXPOSE_HEADERS);
+        }
+    };
+
+    @Override
+    public Mono<Void> writeWith(final ServerWebExchange exchange, final ShenyuPluginChain chain) {
+        // Invoke the chain on subscription, converting synchronous failures into cleanable error signals.
+        Mono<Void> chainResult = Mono.defer(() -> chain.execute(exchange))
+                .doOnError(error -> clean(exchange))
+                .doOnCancel(() -> clean(exchange));
+        return chainResult.then(Mono.defer(() -> {
+            ServerHttpResponse response = exchange.getResponse();
+
+            ResponseEntity<Flux<DataBuffer>> fluxResponseEntity = exchange.getAttribute(Constants.CLIENT_RESPONSE_ATTR);
+            if (Objects.isNull(fluxResponseEntity)) {
+                Object error = ShenyuResultWrap.error(exchange, ShenyuResultEnum.SERVICE_RESULT_ERROR);
+                return WebFluxResultUtils.result(exchange, error);
+            }
+
+            HttpRouteResponseHeaders.apply(exchange, () -> {
+                this.redrawResponseHeaders(response, fluxResponseEntity);
+                deduplicateResponseHeaders(exchange);
+            });
+
+            Mono<Void> responseMono;
+            if (Objects.nonNull(fluxResponseEntity.getBody())) {
+                Flux<DataBuffer> body = fluxResponseEntity.getBody()
+                        .doOnDiscard(DataBuffer.class, DataBufferUtils::release);
+                responseMono = exchange.getResponse().writeWith(body);
+            } else {
+                responseMono = exchange.getResponse().writeWith(Mono.empty());
+            }
+
+            exchange.getAttributes().put(Constants.RESPONSE_MONO, responseMono);
+            // watcher httpStatus
+            final Consumer<HttpStatusCode> consumer = exchange.getAttribute(Constants.WATCHER_HTTP_STATUS);
+            Optional.ofNullable(consumer).ifPresent(c -> c.accept(response.getStatusCode()));
+            return responseMono;
+        }));
+    }
+
+    @Override
+    public List<String> supportTypes() {
+        return Lists.newArrayList(RpcTypeEnum.HTTP.getName(), RpcTypeEnum.SPRING_CLOUD.getName(), RpcTypeEnum.WEB_SOCKET.getName(), RpcTypeEnum.AI.getName());
+    }
+
+    private void redrawResponseHeaders(final ServerHttpResponse response,
+                                       final ResponseEntity<Flux<DataBuffer>> fluxResponseEntity) {
+        // cookies are also headers, and adding them will result in duplicate headers
+        HttpHeaders httpHeaders = fluxResponseEntity.getHeaders();
+        // if the client response has cors header remove cors header from response that crossfilter put
+        if (CORS_HEADERS.stream().anyMatch(httpHeaders::containsKey)) {
+            CORS_HEADERS.forEach(header -> response.getHeaders().remove(header));
+        }
+        // shenyu transfer the cookies so the withCredentials from request is the true,
+        // the Access-Control-Allow-Origin cannot use "*", so use the shenyu crossFilter pushed data
+        // and the ACCESS_CONTROL_ALLOW_CREDENTIALS must set true
+        // https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Access-Control-Allow-Credentials
+        if (httpHeaders.containsKey(HttpHeaders.ACCESS_CONTROL_ALLOW_ORIGIN)) {
+            HttpHeaders temp = new HttpHeaders();
+            temp.putAll(httpHeaders);
+            temp.remove(HttpHeaders.ACCESS_CONTROL_ALLOW_ORIGIN);
+            httpHeaders = temp;
+        }
+        response.getHeaders().putAll(httpHeaders);
+    }
+
+    private void deduplicateResponseHeaders(final ServerWebExchange exchange) {
+        String names = exchange.getAttribute(UniqueHeaderEnum.RESP_UNIQUE_HEADER.getName());
+        if (StringUtils.isEmpty(names)) {
+            return;
+        }
+        HttpHeaders headers = exchange.getResponse().getHeaders();
+        HeaderUniqueStrategyEnum strategy = exchange.getAttributeOrDefault(UniqueHeaderEnum.RESP_UNIQUE_HEADER.getStrategy(), HeaderUniqueStrategyEnum.RETAIN_FIRST);
+        for (String name : StringUtils.split(names, Constants.SEPARATOR_CHARS)) {
+            List<String> values = headers.get(name);
+            if (Objects.isNull(values) || values.size() <= 1) {
+                continue;
+            }
+            switch (strategy) {
+                case RETAIN_FIRST:
+                    headers.set(name, values.get(0));
+                    break;
+                case RETAIN_LAST:
+                    headers.set(name, values.get(values.size() - 1));
+                    break;
+                case RETAIN_UNIQUE:
+                    headers.put(name, new ArrayList<>(new LinkedHashSet<>(values)));
+                    break;
+                default:
+                    throw new IllegalStateException("Unexpected header strategy: " + strategy);
+            }
+        }
+    }
+
+    private void clean(final ServerWebExchange exchange) {
+        if (HttpRouteDeadline.ownsResponseCleanup(exchange)) {
+            return;
+        }
+        ResponseEntity<Flux<DataBuffer>> fluxResponseEntity = exchange.getAttribute(Constants.CLIENT_RESPONSE_ATTR);
+        if (Objects.nonNull(fluxResponseEntity) && Objects.nonNull(fluxResponseEntity.getBody())) {
+            fluxResponseEntity.getBody().map(DataBufferUtils::release).then()
+                    .subscribe(ignored -> { }, error -> LOG.debug("Unable to drain upstream response body during cleanup", error));
+        }
+    }
+
+    static {
+        // https://www.iana.org/assignments/media-types/media-types.xhtml
+        // https://developer.mozilla.org/en-US/docs/Web/HTTP/Basics_of_HTTP/MIME_types
+        // https://en.wikipedia.org/wiki/Media_type
+        // image => .png .jpg .jpeg .gif .webp
+        // audio => .mp2 .mp3
+        // video => .avi .mp4
+        // application/ogg => ogg
+        // zip => .zip .tar .gz
+        // rar => .rar
+        // word => .doc
+        // excel => .xls
+        // csv => .csv
+        // powerpoint => .ppt
+        // openxmlformats-officedocument => .pptx .xlsx .docx
+        // binary => .bin
+        // pdf => .pdf
+        // octet-stream => octet-stream
+        // force-download => force-download
+        Set<String> commonBinaryTypes = new HashSet<>() {
+            {
+                add("image");
+                add("audio");
+                add("video");
+                add("ogg");
+                add("zip");
+                add("rar");
+                add("word");
+                add("excel");
+                add("csv");
+                add("powerpoint");
+                add("openxmlformats-officedocument");
+                add("binary");
+                add("pdf");
+                add("octet-stream");
+                add("force-download");
+            }
+        };
+        StringJoiner regexBuilder = new StringJoiner("|");
+        commonBinaryTypes.forEach(t -> regexBuilder.add(String.format(".*%s.*", t)));
+        COMMON_BIN_MEDIA_TYPE_PATTERN = Pattern.compile(regexBuilder.toString());
+    }
+}

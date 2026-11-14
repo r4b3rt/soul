@@ -1,0 +1,120 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.shenyu.web.loader;
+
+import com.google.common.collect.Sets;
+
+import java.io.File;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Paths;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Objects;
+import java.util.Set;
+import java.util.function.Consumer;
+
+public class ShenyuExtPathPluginJarLoader {
+
+    private static volatile Set<String> pluginJarName = new HashSet<>();
+
+    /**
+     * Load extend plugins list.
+     *
+     * @param path the path
+     * @return the list
+     * @throws IOException the io exception
+     */
+    public static synchronized ExtPluginLoadResult loadExtendPlugins(final String path) throws IOException {
+        return loadExtendPlugins(path, ignored -> { });
+    }
+
+    /**
+     * Discover changed jars and clean registrations belonging to deleted jars.
+     *
+     * @param path extension directory
+     * @param deactivation ownership-aware cleanup callback
+     * @return discovered changes
+     * @throws IOException when a jar cannot be read
+     */
+    public static synchronized ExtPluginLoadResult loadExtendPlugins(final String path, final Consumer<ShenyuPluginClassLoader> deactivation) throws IOException {
+        File[] jarFiles = ShenyuPluginPathBuilder.getPluginFile(path).listFiles(file -> file.getName().endsWith(".jar"));
+        if (Objects.isNull(jarFiles)) {
+            return new ExtPluginLoadResult(Collections.emptyList(), Collections.emptySet());
+        }
+        List<PluginJarParser.PluginJar> uploadPluginJars = new ArrayList<>();
+        Set<String> currentPaths = new HashSet<>();
+        for (File file : jarFiles) {
+            String absolutePath = file.getAbsolutePath();
+            currentPaths.add(absolutePath);
+            byte[] pluginBytes = Files.readAllBytes(Paths.get(absolutePath));
+            PluginJarParser.PluginJar uploadPluginJar = PluginJarParser.parseJar(pluginBytes);
+            uploadPluginJar.setAbsolutePath(absolutePath);
+            if (pluginJarName.contains(absolutePath)) {
+                ShenyuPluginClassLoaderHolder holder = ShenyuPluginClassLoaderHolder.getSingleton();
+                if (holder.hasPluginClassLoader(absolutePath, uploadPluginJar.getVersion())) {
+                    continue;
+                }
+            }
+            uploadPluginJars.add(uploadPluginJar);
+        }
+        Sets.SetView<String> removePluginSet = Sets.difference(pluginJarName, currentPaths);
+        Set<String> removedPluginNames = new HashSet<>();
+        for (String removePath : removePluginSet) {
+            removedPluginNames.addAll(ShenyuPluginClassLoaderHolder.getSingleton().removePluginClassLoader(removePath, deactivation));
+        }
+        pluginJarName = currentPaths;
+        return new ExtPluginLoadResult(uploadPluginJars, removedPluginNames);
+    }
+
+    /**
+     * Ext plugin load result.
+     */
+    public static final class ExtPluginLoadResult {
+
+        private final List<PluginJarParser.PluginJar> pluginJars;
+
+        private final Set<String> removedPluginNames;
+
+        private ExtPluginLoadResult(final List<PluginJarParser.PluginJar> pluginJars, final Set<String> removedPluginNames) {
+            this.pluginJars = pluginJars;
+            this.removedPluginNames = removedPluginNames;
+        }
+
+        /**
+         * Get plugin jars.
+         *
+         * @return plugin jars
+         */
+        public List<PluginJarParser.PluginJar> getPluginJars() {
+            return pluginJars;
+        }
+
+        /**
+         * Get removed plugin names.
+         *
+         * @return removed plugin names
+         */
+        public Set<String> getRemovedPluginNames() {
+            return removedPluginNames;
+        }
+    }
+
+}

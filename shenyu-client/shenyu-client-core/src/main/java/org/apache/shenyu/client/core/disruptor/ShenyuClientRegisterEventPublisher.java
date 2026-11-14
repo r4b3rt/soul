@@ -1,0 +1,118 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.shenyu.client.core.disruptor;
+
+import org.apache.shenyu.client.core.disruptor.executor.RegisterClientConsumerExecutor.RegisterClientExecutorFactory;
+import org.apache.shenyu.client.core.disruptor.subcriber.ShenyuClientApiDocExecutorSubscriber;
+import org.apache.shenyu.client.core.disruptor.subcriber.ShenyuClientMcpExecutorSubscriber;
+import org.apache.shenyu.client.core.disruptor.subcriber.ShenyuClientMetadataExecutorSubscriber;
+import org.apache.shenyu.client.core.disruptor.subcriber.ShenyuClientURIExecutorSubscriber;
+import org.apache.shenyu.disruptor.DisruptorProviderManage;
+import org.apache.shenyu.disruptor.provider.DisruptorProvider;
+import org.apache.shenyu.register.client.api.ShenyuClientRegisterRepository;
+import org.apache.shenyu.register.common.type.DataTypeParent;
+
+import java.util.Objects;
+
+/**
+ * The type shenyu client register event publisher.
+ */
+public class ShenyuClientRegisterEventPublisher {
+
+    private static final ShenyuClientRegisterEventPublisher INSTANCE = new ShenyuClientRegisterEventPublisher();
+
+    private volatile DisruptorProviderManage<DataTypeParent> providerManage;
+
+    /**
+     * Get instance.
+     *
+     * @return ShenyuClientRegisterEventPublisher instance
+     */
+    public static ShenyuClientRegisterEventPublisher getInstance() {
+        return INSTANCE;
+    }
+
+    /**
+     * Start.
+     *
+     * @param shenyuClientRegisterRepository shenyuClientRegisterRepository
+     */
+    public synchronized void start(final ShenyuClientRegisterRepository shenyuClientRegisterRepository) {
+        if (Objects.nonNull(providerManage)) {
+            return;
+        }
+        RegisterClientExecutorFactory factory = new RegisterClientExecutorFactory();
+        factory.addSubscribers(new ShenyuClientMetadataExecutorSubscriber(shenyuClientRegisterRepository));
+        ShenyuClientURIExecutorSubscriber uriSubscriber = createUriSubscriber(shenyuClientRegisterRepository);
+        factory.addSubscribers(uriSubscriber);
+        factory.addSubscribers(new ShenyuClientApiDocExecutorSubscriber(shenyuClientRegisterRepository));
+        factory.addSubscribers(new ShenyuClientMcpExecutorSubscriber(shenyuClientRegisterRepository));
+        DisruptorProviderManage<DataTypeParent> manage = createProviderManage(factory);
+        try {
+            manage.startup();
+            uriSubscriber.start();
+            providerManage = manage;
+        } catch (RuntimeException ex) {
+            uriSubscriber.shutdown();
+            DisruptorProvider<DataTypeParent> provider = manage.getProvider();
+            if (Objects.nonNull(provider)) {
+                provider.shutdown();
+            }
+            throw ex;
+        }
+    }
+
+    /**
+     * Create URI subscriber.
+     *
+     * @param repository register repository
+     * @return URI subscriber
+     */
+    protected ShenyuClientURIExecutorSubscriber createUriSubscriber(final ShenyuClientRegisterRepository repository) {
+        return new ShenyuClientURIExecutorSubscriber(repository);
+    }
+
+    /**
+     * Create provider manager.
+     *
+     * @param factory consumer executor factory
+     * @return provider manager
+     */
+    protected DisruptorProviderManage<DataTypeParent> createProviderManage(final RegisterClientExecutorFactory<DataTypeParent> factory) {
+        return new DisruptorProviderManage<>(factory);
+    }
+
+    /**
+     * Retrieves the Disruptor provider manager used by this ShenyuClientRegisterEventPublisher.
+     *
+     * @return The Disruptor provider manager.
+     */
+    public DisruptorProviderManage<DataTypeParent> getProviderManage() {
+        return providerManage;
+    }
+    
+    /**
+     * Publish event.
+     *
+     * @param data the data
+     */
+    public void publishEvent(final DataTypeParent data) {
+        DisruptorProvider<DataTypeParent> provider = providerManage.getProvider();
+        provider.onData(data);
+    }
+}

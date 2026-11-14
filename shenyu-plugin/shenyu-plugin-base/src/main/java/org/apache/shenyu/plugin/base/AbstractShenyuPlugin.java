@@ -1,0 +1,480 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.shenyu.plugin.base;
+
+import org.apache.commons.collections4.CollectionUtils;
+import org.apache.commons.lang3.StringUtils;
+import org.apache.commons.lang3.tuple.Pair;
+import org.apache.shenyu.common.config.ShenyuConfig;
+import org.apache.shenyu.common.constant.Constants;
+import org.apache.shenyu.common.dto.ConditionData;
+import org.apache.shenyu.common.dto.PluginData;
+import org.apache.shenyu.common.dto.RuleData;
+import org.apache.shenyu.common.dto.SelectorData;
+import org.apache.shenyu.common.enums.MatchModeEnum;
+import org.apache.shenyu.common.enums.SelectorTypeEnum;
+import org.apache.shenyu.plugin.api.ShenyuPlugin;
+import org.apache.shenyu.plugin.api.ShenyuPluginChain;
+import org.apache.shenyu.plugin.api.utils.RequestUrlUtils;
+import org.apache.shenyu.plugin.api.utils.SpringBeanUtils;
+import org.apache.shenyu.plugin.base.cache.BaseDataCache;
+import org.apache.shenyu.plugin.base.cache.MatchDataCache;
+import org.apache.shenyu.plugin.base.condition.strategy.MatchStrategyFactory;
+import org.apache.shenyu.plugin.base.match.SelectorRuleMatchObservation;
+import org.apache.shenyu.plugin.base.match.SelectorRuleMatchObservation.CacheResolution;
+import org.apache.shenyu.plugin.base.match.SelectorRuleMatchObservation.Decision;
+import org.apache.shenyu.plugin.base.match.SelectorRuleMatchObserver;
+import org.apache.shenyu.plugin.base.match.SelectorRuleMatchObserverHolder;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.web.server.ServerWebExchange;
+import reactor.core.publisher.Mono;
+
+import java.util.Collection;
+import java.util.List;
+import java.util.Objects;
+import java.util.Set;
+
+/**
+ * abstract shenyu plugin please extends.
+ */
+public abstract class AbstractShenyuPlugin implements ShenyuPlugin {
+
+    private static final Logger LOG = LoggerFactory.getLogger(AbstractShenyuPlugin.class);
+
+    private static final String URI_CONDITION_TYPE = "uri";
+
+    private static final Set<String> PATH_ONLY_OPERATORS = Set.of("=", "equals", "contains", "startsWith", "endsWith",
+            "match", "regex", "exclude", "pathPattern", "isBlank");
+
+    private ShenyuConfig.SelectorMatchCache selectorMatchConfig;
+    
+    private ShenyuConfig.RuleMatchCache ruleMatchConfig;
+
+    /**
+     * this is Template Method child has implements your own logic.
+     *
+     * @param exchange exchange the current server exchange {@linkplain ServerWebExchange}
+     * @param chain chain the current chain  {@linkplain ServerWebExchange}
+     * @param selector selector    {@linkplain SelectorData}
+     * @param rule rule    {@linkplain RuleData}
+     * @return {@code Mono<Void>} to indicate when request handling is complete
+     */
+    protected abstract Mono<Void> doExecute(ServerWebExchange exchange, ShenyuPluginChain chain, SelectorData selector, RuleData rule);
+
+    /**
+     * Process the Web request and (optionally) delegate to the next
+     * {@code ShenyuPlugin} through the given {@link ShenyuPluginChain}.
+     *
+     * @param exchange the current server exchange
+     * @param chain    provides a way to delegate to the next plugin
+     * @return {@code Mono<Void>} to indicate when request processing is complete
+     */
+    @Override
+    public Mono<Void> execute(final ServerWebExchange exchange, final ShenyuPluginChain chain) {
+        initCacheConfig();
+        final String pluginName = named();
+        PluginData pluginData = BaseDataCache.getInstance().obtainPluginData(pluginName);
+        // early exit
+        if (Objects.isNull(pluginData) || !pluginData.getEnabled()) {
+            reportDecision(Objects.isNull(pluginData) ? Decision.NO_PLUGIN_DATA : Decision.PLUGIN_DISABLED,
+                    null, null, false, CacheResolution.NOT_CONSULTED, CacheResolution.NOT_CONSULTED);
+            return chain.execute(exchange);
+        }
+        final String path = getRawPath(exchange);
+        List<SelectorData> selectors = BaseDataCache.getInstance().obtainSelectorData(pluginName);
+        if (CollectionUtils.isEmpty(selectors)) {
+            reportDecision(Decision.NO_SELECTOR, null, null, false,
+                    CacheResolution.NOT_CONSULTED, CacheResolution.NOT_CONSULTED);
+            return handleSelectorIfNull(pluginName, exchange, chain);
+        }
+        SelectorData selectorData = obtainSelectorDataCacheIfEnabled(path);
+        CacheResolution selectorCache = Objects.nonNull(selectorData) ? CacheResolution.POSITIVE_HIT
+                : cacheResolution(selectorMatchConfig.getCache().getEnabled());
+        // handle Selector
+        if (Objects.nonNull(selectorData) && StringUtils.isBlank(selectorData.getId())) {
+            reportDecision(Decision.NO_SELECTOR, null, null, false,
+                    CacheResolution.NEGATIVE_HIT, CacheResolution.NOT_CONSULTED);
+            return handleSelectorIfNull(pluginName, exchange, chain);
+        }
+        if (Objects.isNull(selectorData)) {
+            selectorData = defaultMatchSelector(exchange, selectors, path);
+            if (Objects.isNull(selectorData)) {
+                reportDecision(Decision.SELECTOR_UNMATCHED, null, null, false,
+                        selectorCache, CacheResolution.NOT_CONSULTED);
+                return handleSelectorIfNull(pluginName, exchange, chain);
+            }
+        }
+        printLog(selectorData, pluginName);
+        if (!selectorData.getContinued()) {
+            // if continued， not match rules
+            reportDecision(Decision.SELECTOR_NOT_CONTINUED, selectorData, null, true,
+                    selectorCache, CacheResolution.NOT_CONSULTED);
+            return doExecute(exchange, chain, selectorData, defaultRuleData(selectorData));
+        }
+        return matchRuleAndExecute(exchange, chain, pluginName, selectors, path, selectorData, selectorCache);
+    }
+
+    private Mono<Void> matchRuleAndExecute(final ServerWebExchange exchange, final ShenyuPluginChain chain,
+                                           final String pluginName, final List<SelectorData> selectors,
+                                           final String path, final SelectorData selectorData,
+                                           final CacheResolution selectorCache) {
+        List<RuleData> rules = BaseDataCache.getInstance().obtainRuleData(selectorData.getId());
+        if (CollectionUtils.isEmpty(rules)) {
+            reportDecision(Decision.NO_RULE, selectorData, null, false,
+                    selectorCache, CacheResolution.NOT_CONSULTED);
+            return handleRuleIfNull(pluginName, exchange, chain);
+        }
+        if (selectorData.getType() == SelectorTypeEnum.FULL_FLOW.getCode()) {
+            RuleData rule = lastEnabledRule(rules);
+            if (Objects.isNull(rule)) {
+                reportDecision(Decision.FULL_FLOW_NO_ENABLED_RULE, selectorData, null, false,
+                        selectorCache, CacheResolution.NOT_CONSULTED);
+                return handleRuleIfNull(pluginName, exchange, chain);
+            }
+            printLog(rule, pluginName);
+            reportDecision(Decision.FULL_FLOW_RULE, selectorData, rule, false,
+                    selectorCache, CacheResolution.NOT_CONSULTED);
+            return doExecute(exchange, chain, selectorData, rule);
+        }
+        // consult the bounded per-path match cache first when it is enabled.
+        // on a cache miss, match the current rule list with the default strategy.
+        RuleData ruleData = obtainRuleDataCacheIfEnabled(path);
+        CacheResolution ruleCache = Objects.nonNull(ruleData) ? CacheResolution.POSITIVE_HIT
+                : cacheResolution(ruleMatchConfig.getCache().getEnabled());
+        if (Objects.nonNull(ruleData) && Objects.isNull(ruleData.getId())) {
+            reportDecision(Decision.NO_RULE, selectorData, null, false,
+                    selectorCache, CacheResolution.NEGATIVE_HIT);
+            return handleRuleIfNull(pluginName, exchange, chain);
+        }
+        if (Objects.isNull(ruleData)) {
+            ruleData = defaultMatchRule(exchange, selectors, rules, path);
+            if (Objects.isNull(ruleData)) {
+                reportDecision(Decision.RULE_UNMATCHED, selectorData, null, false,
+                        selectorCache, ruleCache);
+                return handleRuleIfNull(pluginName, exchange, chain);
+            }
+        }
+        printLog(ruleData, pluginName);
+        reportDecision(Decision.SELECTED, selectorData, ruleData, false, selectorCache, ruleCache);
+        return doExecute(exchange, chain, selectorData, ruleData);
+    }
+
+    private static RuleData lastEnabledRule(final List<RuleData> rules) {
+        for (int i = rules.size() - 1; i >= 0; i--) {
+            RuleData rule = rules.get(i);
+            if (Boolean.TRUE.equals(rule.getEnabled())) {
+                return rule;
+            }
+        }
+        return null;
+    }
+
+    private static CacheResolution cacheResolution(final boolean cacheEnabled) {
+        return cacheEnabled ? CacheResolution.EVALUATED : CacheResolution.NOT_CONSULTED;
+    }
+
+    /**
+     * Report one matching decision to the registered observer, if any.
+     *
+     * <p>The summary is built only when an observer is registered, so the un-instrumented
+     * path performs a single null read and allocates nothing. The report never re-runs a
+     * predicate: it only names the branch just taken and the ids already in hand.</p>
+     *
+     * @param decision the decision reason
+     * @param selector the selected selector, or null
+     * @param rule the selected rule, or null
+     * @param defaultRule whether the rule is the synthetic default rule
+     * @param selectorCache how the selector stage resolved its cache
+     * @param ruleCache how the rule stage resolved its cache
+     */
+    private void reportDecision(final Decision decision, final SelectorData selector, final RuleData rule,
+                                final boolean defaultRule, final CacheResolution selectorCache,
+                                final CacheResolution ruleCache) {
+        SelectorRuleMatchObserver observer = SelectorRuleMatchObserverHolder.get();
+        if (Objects.isNull(observer)) {
+            return;
+        }
+        try {
+            final String ruleId = defaultRule ? Constants.DEFAULT_RULE : (Objects.isNull(rule) ? null : rule.getId());
+            observer.onMatchDecision(SelectorRuleMatchObservation.of(named(), decision,
+                    Objects.isNull(selector) ? null : selector.getId(), ruleId,
+                    defaultRule, selectorCache, ruleCache));
+        } catch (RuntimeException ignored) {
+            // a broken observer must never influence the request outcome
+        }
+    }
+    
+    protected String getRawPath(final ServerWebExchange exchange) {
+        return RequestUrlUtils.getRewrittenRawPath(exchange);
+    }
+    
+    private void initCacheConfig() {
+        if (Objects.isNull(selectorMatchConfig) || Objects.isNull(ruleMatchConfig)) {
+            ShenyuConfig shenyuConfig = SpringBeanUtils.getInstance().getBean(ShenyuConfig.class);
+            selectorMatchConfig = shenyuConfig.getSelectorMatchCache();
+            ruleMatchConfig = shenyuConfig.getRuleMatchCache();
+        }
+    }
+    
+    private SelectorData obtainSelectorDataCacheIfEnabled(final String path) {
+        return selectorMatchConfig.getCache().getEnabled() ? MatchDataCache.getInstance().obtainSelectorData(named(), path) : null;
+    }
+    
+    private RuleData obtainRuleDataCacheIfEnabled(final String path) {
+        return ruleMatchConfig.getCache().getEnabled() ? MatchDataCache.getInstance().obtainRuleData(named(), path) : null;
+    }
+
+    private void cacheSelectorData(final String path, final SelectorData selectorData) {
+        if (Boolean.FALSE.equals(selectorMatchConfig.getCache().getEnabled()) || Objects.isNull(selectorData)
+                || Boolean.TRUE.equals(selectorData.getMatchRestful())) {
+            return;
+        }
+        int initialCapacity = selectorMatchConfig.getCache().getInitialCapacity();
+        long maximumSize = selectorMatchConfig.getCache().getMaximumSize();
+        long ttl = selectorMatchConfig.getCache().getTtl();
+        if (StringUtils.isBlank(selectorData.getId())) {
+            MatchDataCache.getInstance().cacheSelectorData(path, selectorData, initialCapacity, maximumSize, ttl);
+            return;
+        }
+        List<ConditionData> conditionList = selectorData.getConditionList();
+        if (CollectionUtils.isNotEmpty(conditionList)) {
+            boolean isUriCondition = conditionList.stream().allMatch(v -> URI_CONDITION_TYPE.equals(v.getParamType()));
+            if (isUriCondition) {
+                MatchDataCache.getInstance().cacheSelectorData(path, selectorData, initialCapacity, maximumSize, ttl);
+            }
+        }
+    }
+    
+    private void cacheRuleData(final String path, final RuleData ruleData) {
+        // if the ruleCache is disabled or rule data is null, not cache rule data.
+        if (Boolean.FALSE.equals(ruleMatchConfig.getCache().getEnabled()) || Objects.isNull(ruleData)
+                || Boolean.TRUE.equals(ruleData.getMatchRestful())) {
+            return;
+        }
+        int initialCapacity = ruleMatchConfig.getCache().getInitialCapacity();
+        long maximumSize = ruleMatchConfig.getCache().getMaximumSize();
+        long ttl = ruleMatchConfig.getCache().getTtl();
+        if (StringUtils.isBlank(ruleData.getId())) {
+            MatchDataCache.getInstance().cacheRuleData(path, ruleData, initialCapacity, maximumSize, ttl);
+            return;
+        }
+        List<ConditionData> conditionList = ruleData.getConditionDataList();
+        if (CollectionUtils.isNotEmpty(conditionList)) {
+            boolean isUriCondition = conditionList.stream().allMatch(v -> URI_CONDITION_TYPE.equals(v.getParamType()));
+            if (isUriCondition) {
+                MatchDataCache.getInstance().cacheRuleData(path, ruleData, initialCapacity, maximumSize, ttl);
+            }
+        }
+    }
+
+    private RuleData defaultRuleData(final SelectorData selectorData) {
+        RuleData ruleData = new RuleData();
+        ruleData.setSelectorId(selectorData.getId());
+        ruleData.setPluginName(selectorData.getPluginName());
+        ruleData.setId(Constants.DEFAULT_RULE);
+        return ruleData;
+    }
+    
+    /**
+     * Handle selector if null mono.
+     *
+     * @param pluginName the plugin name
+     * @param exchange the exchange
+     * @param chain the chain
+     * @return the mono
+     */
+    protected Mono<Void> handleSelectorIfNull(final String pluginName, final ServerWebExchange exchange, final ShenyuPluginChain chain) {
+        return chain.execute(exchange);
+    }
+    
+    /**
+     * Handle rule if null mono.
+     *
+     * @param pluginName the plugin name
+     * @param exchange the exchange
+     * @param chain the chain
+     * @return the mono
+     */
+    protected Mono<Void> handleRuleIfNull(final String pluginName, final ServerWebExchange exchange, final ShenyuPluginChain chain) {
+        return chain.execute(exchange);
+    }
+
+    private Pair<Boolean, SelectorData> matchSelector(final ServerWebExchange exchange, final Collection<SelectorData> selectors) {
+        SelectorData best = null;
+        int bestSpecificity = -1;
+        boolean unique = true;
+        for (SelectorData selector : selectors) {
+            if (!selector.getEnabled() || !filterSelector(selector, exchange)) {
+                continue;
+            }
+            if (Objects.nonNull(best)) {
+                if (best.equals(selector)) {
+                    continue;
+                }
+                unique = false;
+            }
+            int specificity = MatchModeEnum.match(selector.getMatchMode(), MatchModeEnum.AND) ? CollectionUtils.size(selector.getConditionList()) : 0;
+            if (Objects.isNull(best) || specificity > bestSpecificity || specificity == bestSpecificity && selector.getSort() < best.getSort()) {
+                best = selector;
+                bestSpecificity = specificity;
+            }
+        }
+        return Pair.of(unique, best);
+    }
+
+    private Boolean filterSelector(final SelectorData selector, final ServerWebExchange exchange) {
+        if (selector.getType() == SelectorTypeEnum.CUSTOM_FLOW.getCode()) {
+            if (CollectionUtils.isEmpty(selector.getConditionList())) {
+                return false;
+            }
+            return MatchStrategyFactory.match(selector.getMatchMode(), selector.getConditionList(), exchange);
+        }
+        return true;
+    }
+
+    private Pair<Boolean, RuleData> matchRule(final ServerWebExchange exchange, final Collection<RuleData> rules) {
+        RuleData best = null;
+        int bestSpecificity = -1;
+        boolean unique = true;
+        for (RuleData rule : rules) {
+            if (!filterRule(rule, exchange)) {
+                continue;
+            }
+            if (Objects.nonNull(best)) {
+                if (best.equals(rule)) {
+                    continue;
+                }
+                unique = false;
+            }
+            int specificity = MatchModeEnum.match(rule.getMatchMode(), MatchModeEnum.AND) ? CollectionUtils.size(rule.getConditionDataList()) : 0;
+            if (Objects.isNull(best) || specificity > bestSpecificity || specificity == bestSpecificity && rule.getSort() < best.getSort()) {
+                best = rule;
+                bestSpecificity = specificity;
+            }
+        }
+        return Pair.of(unique, best);
+    }
+
+    private Boolean filterRule(final RuleData ruleData, final ServerWebExchange exchange) {
+        return ruleData.getEnabled() && MatchStrategyFactory.match(ruleData.getMatchMode(), ruleData.getConditionDataList(), exchange);
+    }
+    
+    private SelectorData defaultMatchSelector(final ServerWebExchange exchange, final List<SelectorData> selectors, final String path) {
+        Pair<Boolean, SelectorData> matchSelectorPair = matchSelector(exchange, selectors);
+        SelectorData selectorData = matchSelectorPair.getRight();
+        if (Objects.nonNull(selectorData)) {
+            // cache selector data
+            if (matchSelectorPair.getLeft() && selectors.stream().filter(SelectorData::getEnabled)
+                    .allMatch(selector -> !Boolean.TRUE.equals(selector.getMatchRestful()) && pathOnlyConditions(selector.getConditionList()))) {
+                cacheSelectorData(path, selectorData);
+            }
+            return selectorData;
+        } else {
+            // A negative entry is keyed by (plugin, path), so it is only sound when every
+            // enabled candidate is decided by the path.
+            if (matchSelectorPair.getLeft() && pathOnlySelectorSet(selectors)) {
+                SelectorData emptySelectorData = SelectorData.builder().pluginName(named()).build();
+                cacheSelectorData(path, emptySelectorData);
+            }
+            return null;
+        }
+    }
+    
+    private RuleData defaultMatchRule(final ServerWebExchange exchange, final List<SelectorData> selectors,
+                                      final List<RuleData> rules, final String path) {
+        Pair<Boolean, RuleData> matchRulePair = matchRule(exchange, rules);
+        RuleData ruleData = matchRulePair.getRight();
+        if (Objects.nonNull(ruleData)) {
+            // cache rule data
+            if (matchRulePair.getLeft() && rules.stream().filter(RuleData::getEnabled)
+                    .allMatch(rule -> !Boolean.TRUE.equals(rule.getMatchRestful()) && pathOnlyConditions(rule.getConditionDataList()))) {
+                cacheRuleData(path, ruleData);
+            }
+            return ruleData;
+        } else {
+            // The rule cache key carries no selector id, so a negative entry additionally
+            // requires the whole selector set to be decided by the path.
+            if (matchRulePair.getLeft() && pathOnlySelectorSet(selectors) && pathOnlyRuleSet(rules)) {
+                RuleData emptyRuleData = RuleData.builder().pluginName(named()).build();
+                cacheRuleData(path, emptyRuleData);
+            }
+            return null;
+        }
+    }
+    
+    private boolean pathOnlyConditions(final List<ConditionData> conditions) {
+        // A path cache hit skips the entire candidate set, including candidates that did not
+        // match the warming request but could win for different request attributes.
+        // Time predicates and unknown SPI operators can depend on state outside the URI.
+        return CollectionUtils.isNotEmpty(conditions) && conditions.stream().allMatch(condition -> Objects.nonNull(condition)
+                && URI_CONDITION_TYPE.equals(condition.getParamType()) && Objects.nonNull(condition.getOperator())
+                && PATH_ONLY_OPERATORS.contains(condition.getOperator()));
+    }
+
+    private boolean pathOnlySelectorSet(final List<SelectorData> selectors) {
+        for (SelectorData selector : selectors) {
+            if (!Boolean.TRUE.equals(selector.getEnabled())) {
+                continue;
+            }
+            if (Boolean.TRUE.equals(selector.getMatchRestful()) || !pathOnlyConditions(selector.getConditionList())) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private boolean pathOnlyRuleSet(final List<RuleData> rules) {
+        for (RuleData rule : rules) {
+            if (!Boolean.TRUE.equals(rule.getEnabled())) {
+                continue;
+            }
+            if (Boolean.TRUE.equals(rule.getMatchRestful()) || !pathOnlyConditions(rule.getConditionDataList())) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * print selector log.
+     * please don't delete this method or refactor {@linkplain org.apache.shenyu.plugin.base.AbstractShenyuPlugin#printLog}
+     * because instanceof and class cast waste 10% cpu.
+     *
+     * @param selectorData selector data
+     * @param pluginName plugin name
+     */
+    private void printLog(final SelectorData selectorData, final String pluginName) {
+        if (selectorData.getLogged()) {
+            LOG.info("{} selector success match , selector name :{}", pluginName, selectorData.getName());
+        }
+    }
+    
+    /**
+     * print rule log.
+     *
+     * @param ruleData rule data
+     * @param pluginName plugin name
+     */
+    private void printLog(final RuleData ruleData, final String pluginName) {
+        if (Boolean.TRUE.equals(ruleData.getLogged())) {
+            LOG.info("{} rule success match , rule name :{}", pluginName, ruleData.getName());
+        }
+    }
+    
+}

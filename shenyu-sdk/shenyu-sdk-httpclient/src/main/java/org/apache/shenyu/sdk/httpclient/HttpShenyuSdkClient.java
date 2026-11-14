@@ -1,0 +1,219 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.shenyu.sdk.httpclient;
+
+import org.apache.commons.lang3.StringUtils;
+import org.apache.http.Header;
+import org.apache.http.HttpResponse;
+import org.apache.http.client.config.RequestConfig;
+import org.apache.http.client.methods.RequestBuilder;
+import org.apache.http.concurrent.FutureCallback;
+import org.apache.http.config.Registry;
+import org.apache.http.config.RegistryBuilder;
+import org.apache.http.entity.ContentType;
+import org.apache.http.entity.StringEntity;
+import org.apache.http.impl.nio.client.CloseableHttpAsyncClient;
+import org.apache.http.impl.nio.client.HttpAsyncClients;
+import org.apache.http.impl.nio.conn.PoolingNHttpClientConnectionManager;
+import org.apache.http.impl.nio.reactor.DefaultConnectingIOReactor;
+import org.apache.http.nio.conn.NoopIOSessionStrategy;
+import org.apache.http.nio.conn.SchemeIOSessionStrategy;
+import org.apache.http.nio.conn.ssl.SSLIOSessionStrategy;
+import org.apache.http.nio.reactor.ConnectingIOReactor;
+import org.apache.http.util.EntityUtils;
+import org.apache.shenyu.common.exception.ShenyuException;
+import org.apache.shenyu.sdk.core.ShenyuRequest;
+import org.apache.shenyu.sdk.core.ShenyuResponse;
+import org.apache.shenyu.sdk.core.client.AbstractShenyuSdkClient;
+import org.apache.shenyu.spi.Join;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.IOException;
+import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.LinkedList;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Properties;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Future;
+import java.util.stream.Collectors;
+
+/**
+ * shenyu httpclient.
+ */
+@Join(isSingleton = false)
+public class HttpShenyuSdkClient extends AbstractShenyuSdkClient {
+
+    private static final Logger LOG = LoggerFactory.getLogger(HttpShenyuSdkClient.class);
+
+    private PoolingNHttpClientConnectionManager connectionManager;
+
+    private RequestConfig requestConfig;
+
+    private CloseableHttpAsyncClient httpAsyncClient;
+
+    @Override
+    protected void initClient(final Properties props) {
+        try {
+            final String maxTotal = props.getProperty("http.maxTotal", "800");
+            final String maxPerRoute = props.getProperty("http.maxPerRoute", "200");
+            final String serverRequestTimeOut = props.getProperty("http.serverRequestTimeOut", "2000");
+            final String serverResponseTimeOut = props.getProperty("http.serverResponseTimeOut", "2000");
+            final String connectionRequestTimeOut = props.getProperty("http.connectionRequestTimeOut", "2000");
+            Registry<SchemeIOSessionStrategy> sessionStrategyRegistry = RegistryBuilder.<SchemeIOSessionStrategy>create()
+                    .register("https", SSLIOSessionStrategy.getDefaultStrategy())
+                    .register("http", NoopIOSessionStrategy.INSTANCE)
+                    .build();
+            ConnectingIOReactor ioReactor = new DefaultConnectingIOReactor();
+            this.connectionManager = new PoolingNHttpClientConnectionManager(ioReactor, sessionStrategyRegistry);
+            connectionManager.setMaxTotal(Integer.parseInt(maxTotal));
+            connectionManager.setDefaultMaxPerRoute(Integer.parseInt(maxPerRoute));
+            this.requestConfig = RequestConfig.custom()
+                    .setSocketTimeout(Integer.parseInt(serverRequestTimeOut))
+                    .setConnectTimeout(Integer.parseInt(serverResponseTimeOut))
+                    .setConnectionRequestTimeout(Integer.parseInt(connectionRequestTimeOut))
+                    .build();
+            this.httpAsyncClient = getHttpClient();
+        } catch (Exception e) {
+            throw new ShenyuException(e);
+        }
+    }
+
+    private CloseableHttpAsyncClient getHttpClient() {
+        CloseableHttpAsyncClient client = HttpAsyncClients.custom().setDefaultRequestConfig(requestConfig)
+                .setConnectionManager(connectionManager)
+                .build();
+        client.start();
+        return client;
+    }
+
+    @Override
+    public void close() throws IOException {
+        try {
+            if (Objects.nonNull(httpAsyncClient)) {
+                httpAsyncClient.close();
+            }
+        } finally {
+            if (Objects.nonNull(connectionManager)) {
+                connectionManager.shutdown();
+            }
+        }
+    }
+
+    @Override
+    protected ShenyuResponse doRequest(final ShenyuRequest request) throws IOException {
+        String url = request.getUrl();
+        String body = request.getBody();
+        RequestBuilder requestBuilder;
+        
+        switch (request.getHttpMethod()) {
+            case GET:
+                requestBuilder = RequestBuilder.get(url);
+                break;
+            case HEAD:
+                requestBuilder = RequestBuilder.head(url);
+                break;
+            case POST:
+                requestBuilder = RequestBuilder.post(url);
+                break;
+            case PUT:
+                requestBuilder = RequestBuilder.put(url);
+                break;
+            case DELETE:
+                requestBuilder = RequestBuilder.delete(url);
+                break;
+            case OPTIONS:
+                requestBuilder = RequestBuilder.options(url);
+                break;
+            case TRACE:
+                requestBuilder = RequestBuilder.trace(url);
+                break;
+            default:
+                requestBuilder = RequestBuilder.patch(url);
+                break;
+        }
+        Map<String, Collection<String>> headers = request.getHeaders();
+        for (String name : headers.keySet()) {
+            for (String value : headers.get(name)) {
+                requestBuilder.addHeader(name, value);
+            }
+        }
+        if (StringUtils.isNotBlank(body)) {
+            requestBuilder.setEntity(createStringEntity(body, requestBuilder.getFirstHeader("Content-Type")));
+        }
+        Future<HttpResponse> execute = httpAsyncClient.execute(requestBuilder.build(), new FutureCallback<>() {
+            @Override
+            public void completed(final HttpResponse response) {
+                LOG.debug("HttpResponse completed statusLine={}", response.getStatusLine());
+            }
+            
+            @Override
+            public void failed(final Exception ex) {
+                LOG.error("HttpResponse failed", ex);
+            }
+            
+            @Override
+            public void cancelled() {
+                LOG.debug("HttpResponse cancelled.");
+            }
+        });
+        HttpResponse response = waitForResponse(execute);
+        return new ShenyuResponse(response.getStatusLine().getStatusCode(), response.getStatusLine().getReasonPhrase(),
+                Arrays.stream(response.getAllHeaders()).collect(Collectors.groupingBy(Header::getName, HashMap::new,
+                        Collectors.mapping(Header::getValue, Collectors.toCollection(LinkedList::new)))),
+                Objects.isNull(response.getEntity()) ? null : EntityUtils.toString(response.getEntity(), StandardCharsets.UTF_8), request);
+    }
+
+    private HttpResponse waitForResponse(final Future<HttpResponse> responseFuture) throws IOException {
+        try {
+            return responseFuture.get();
+        } catch (InterruptedException e) {
+            responseFuture.cancel(true);
+            Thread.currentThread().interrupt();
+            throw new IOException("Interrupted while waiting for the HTTP response", e);
+        } catch (ExecutionException e) {
+            Throwable cause = e.getCause();
+            if (cause instanceof IOException) {
+                throw (IOException) cause;
+            }
+            if (cause instanceof RuntimeException) {
+                throw (RuntimeException) cause;
+            }
+            if (cause instanceof Error) {
+                throw (Error) cause;
+            }
+            throw new IOException("HTTP request failed", cause);
+        } catch (CancellationException e) {
+            throw new IOException("HTTP request was cancelled", e);
+        }
+    }
+
+    private StringEntity createStringEntity(final String body, final Header contentTypeHeader) {
+        String contentType = Objects.isNull(contentTypeHeader) ? "application/json;charset=UTF-8" : contentTypeHeader.getValue();
+        Charset charset = Objects.requireNonNullElse(ContentType.parse(contentType).getCharset(), StandardCharsets.UTF_8);
+        StringEntity stringEntity = new StringEntity(body, charset);
+        stringEntity.setContentType(contentType);
+        return stringEntity;
+    }
+}

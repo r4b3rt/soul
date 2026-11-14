@@ -1,0 +1,151 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.shenyu.plugin.wasm.base.handler;
+
+import com.dylibso.chicory.runtime.ExportFunction;
+import org.apache.shenyu.common.dto.PluginData;
+import org.apache.shenyu.common.dto.RuleData;
+import org.apache.shenyu.common.dto.SelectorData;
+import org.apache.shenyu.plugin.base.handler.PluginDataHandler;
+import org.apache.shenyu.plugin.wasm.api.loader.WasmLoader;
+
+import java.util.Map;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.ConcurrentHashMap;
+
+/**
+ * AbstractWasmPluginDataHandler.
+ */
+public abstract class AbstractWasmPluginDataHandler extends WasmLoader implements PluginDataHandler {
+    
+    protected static final Map<Long, PluginData> PLUGIN_ARGUMENTS = new ConcurrentHashMap<>();
+    
+    protected static final String HANDLER_PLUGIN_METHOD_NAME = "handlerPlugin";
+    
+    protected static final String REMOVE_PLUGIN_METHOD_NAME = "removePlugin";
+    
+    protected static final Map<Long, SelectorData> SELECTOR_ARGUMENTS = new ConcurrentHashMap<>();
+    
+    protected static final String HANDLER_SELECTOR_METHOD_NAME = "handlerSelector";
+    
+    protected static final String REMOVE_SELECTOR_METHOD_NAME = "removeSelector";
+    
+    protected static final Map<Long, RuleData> RULE_ARGUMENTS = new ConcurrentHashMap<>();
+
+    
+    protected static final String HANDLER_RULE_METHOD_NAME = "handlerRule";
+    
+    protected static final String REMOVE_RULE_METHOD_NAME = "removeRule";
+    
+    /**
+     * Argument ids key the shared static argument maps, and every call removes its entry in a
+     * finally block, so ids must be globally unique: overlapping calls with equal ids would
+     * overwrite each other's argument and the first cleanup would drop the other call's entry.
+     */
+    private static final AtomicLong NEXT_ARGUMENT_ID = new AtomicLong();
+    
+    @Override
+    public void handlerPlugin(final PluginData pluginData) {
+        super.getWasmExtern(HANDLER_PLUGIN_METHOD_NAME)
+                .ifPresent(handlerPlugin -> callWASI(pluginData, handlerPlugin));
+    }
+    
+    @Override
+    public void removePlugin(final PluginData pluginData) {
+        super.getWasmExtern(REMOVE_PLUGIN_METHOD_NAME)
+                .ifPresent(handlerPlugin -> callWASI(pluginData, handlerPlugin));
+    }
+    
+    @Override
+    public void handlerSelector(final SelectorData selectorData) {
+        super.getWasmExtern(HANDLER_SELECTOR_METHOD_NAME)
+                .ifPresent(handlerPlugin -> callWASI(selectorData, handlerPlugin));
+    }
+    
+    @Override
+    public void removeSelector(final SelectorData selectorData) {
+        super.getWasmExtern(REMOVE_SELECTOR_METHOD_NAME)
+                .ifPresent(handlerPlugin -> callWASI(selectorData, handlerPlugin));
+    }
+    
+    @Override
+    public void handlerRule(final RuleData ruleData) {
+        super.getWasmExtern(HANDLER_RULE_METHOD_NAME)
+                .ifPresent(handlerPlugin -> callWASI(ruleData, handlerPlugin));
+    }
+    
+    @Override
+    public void removeRule(final RuleData ruleData) {
+        super.getWasmExtern(REMOVE_RULE_METHOD_NAME)
+                .ifPresent(handlerPlugin -> callWASI(ruleData, handlerPlugin));
+    }
+
+    private Long callWASI(final PluginData pluginData, final ExportFunction execute) {
+        // WASI cannot easily pass Java objects like JNI, here we pass Long as arg
+        // then we can get the argument by Long
+        final Long argumentId = getPluginArgumentId(pluginData);
+        PLUGIN_ARGUMENTS.put(argumentId, pluginData);
+        // call WASI function
+        try {
+            execute.apply(argumentId);
+        } finally {
+            PLUGIN_ARGUMENTS.remove(argumentId);
+        }
+        return argumentId;
+    }
+
+    private Long callWASI(final RuleData ruleData, final ExportFunction execute) {
+        // WASI cannot easily pass Java objects like JNI, here we pass Long as arg
+        // then we can get the argument by Long
+        final Long argumentId = getRuleArgumentId(ruleData);
+        RULE_ARGUMENTS.put(argumentId, ruleData);
+        // call WASI function
+        try {
+            execute.apply(argumentId);
+        } finally {
+            RULE_ARGUMENTS.remove(argumentId);
+        }
+        return argumentId;
+    }
+
+    private Long callWASI(final SelectorData selectorData, final ExportFunction execute) {
+        // WASI cannot easily pass Java objects like JNI, here we pass Long as arg
+        // then we can get the argument by Long
+        final Long argumentId = getSelectorArgumentId(selectorData);
+        SELECTOR_ARGUMENTS.put(argumentId, selectorData);
+        // call WASI function
+        try {
+            execute.apply(argumentId);
+        } finally {
+            SELECTOR_ARGUMENTS.remove(argumentId);
+        }
+        return argumentId;
+    }
+    
+    protected Long getPluginArgumentId(final PluginData pluginData) {
+        return NEXT_ARGUMENT_ID.incrementAndGet();
+    }
+    
+    protected Long getSelectorArgumentId(final SelectorData selectorData) {
+        return NEXT_ARGUMENT_ID.incrementAndGet();
+    }
+    
+    protected Long getRuleArgumentId(final RuleData ruleData) {
+        return NEXT_ARGUMENT_ID.incrementAndGet();
+    }
+}

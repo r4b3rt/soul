@@ -1,0 +1,351 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.shenyu.plugin.logging.common.collector;
+
+import com.google.common.collect.Maps;
+import org.apache.shenyu.common.concurrent.MemorySafeTaskQueue;
+import org.apache.shenyu.common.concurrent.ShenyuThreadFactory;
+import org.apache.shenyu.common.concurrent.ShenyuThreadPoolExecutor;
+import org.apache.shenyu.common.config.ShenyuConfig;
+import org.apache.shenyu.common.constant.Constants;
+import org.apache.shenyu.common.metrics.LoggingQueueMetrics;
+import org.apache.shenyu.common.metrics.LoggingQueueMetrics.Mode;
+import org.apache.shenyu.common.utils.Singleton;
+import org.apache.shenyu.common.utils.ThreadUtils;
+import org.apache.shenyu.plugin.logging.common.client.AbstractLogConsumeClient;
+import org.apache.shenyu.plugin.logging.common.config.GenericGlobalConfig;
+import org.apache.shenyu.plugin.logging.common.constant.GenericLoggingConstant;
+import org.apache.shenyu.plugin.logging.common.entity.ShenyuRequestLog;
+import org.apache.shenyu.plugin.logging.desensitize.api.matcher.KeyWordMatch;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.LinkedBlockingDeque;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
+
+import static org.apache.shenyu.plugin.logging.desensitize.api.utils.DataDesensitizeUtils.desensitizeForBody;
+import static org.apache.shenyu.plugin.logging.desensitize.api.utils.DataDesensitizeUtils.desensitizeForSingleWord;
+import static org.apache.shenyu.plugin.logging.desensitize.api.utils.DataDesensitizeUtils.desensitizeQueryParams;
+
+/**
+ * abstract log collector,Contains common methods.
+ */
+public abstract class AbstractLogCollector<T extends AbstractLogConsumeClient<?, L>, L extends ShenyuRequestLog, C extends GenericGlobalConfig>
+        implements LogCollector<L> {
+
+    private static final Logger LOG = LoggerFactory.getLogger(AbstractLogCollector.class);
+
+    private volatile int bufferSize;
+
+    private volatile BlockingQueue<L> bufferQueue;
+
+    private final Map<String, BlockingQueue<L>> bufferQueueS = Maps.newConcurrentMap();
+
+    private final Map<String, Long> lastPushTimeS = Maps.newConcurrentMap();
+
+    private long lastPushTime;
+
+    private final AtomicBoolean started = new AtomicBoolean(false);
+
+    private final AtomicLong multiBufferCapacity = new AtomicLong();
+
+    private final LoggingQueueMetrics singleClientMetrics = new LoggingQueueMetrics(getClass(), Mode.SINGLE,
+            () -> started.get() ? bufferQueue.size() : 0,
+            () -> isActiveMode(false) ? bufferSize : 0);
+
+    private final LoggingQueueMetrics multiClientMetrics = new LoggingQueueMetrics(getClass(), Mode.MULTI,
+            () -> started.get() ? bufferQueueS.values().stream().mapToLong(BlockingQueue::size).sum() : 0,
+            () -> isActiveMode(true) ? multiBufferCapacity.get() : 0);
+
+    private ShenyuThreadPoolExecutor executor;
+
+    @Override
+    public synchronized void start() {
+        refreshBufferSize();
+        if (started.get()) {
+            return;
+        }
+        // Admission is bounded in collect(), allowing live capacity changes without dropping queued logs.
+        bufferQueue = new LinkedBlockingDeque<>();
+        ShenyuConfig config = Optional.ofNullable(Singleton.INST.get(ShenyuConfig.class)).orElse(new ShenyuConfig());
+        final ShenyuConfig.SharedPool sharedPool = config.getSharedPool();
+        ShenyuThreadPoolExecutor threadExecutor = new ShenyuThreadPoolExecutor(sharedPool.getCorePoolSize(),
+                sharedPool.getMaximumPoolSize(), sharedPool.getKeepAliveTime(), TimeUnit.MILLISECONDS,
+                new MemorySafeTaskQueue<>(Constants.THE_256_MB),
+                ShenyuThreadFactory.create(config.getSharedPool().getPrefix(), true),
+                new ThreadPoolExecutor.AbortPolicy());
+        started.set(true);
+        executor = threadExecutor;
+        try {
+            threadExecutor.execute(() -> consume(threadExecutor));
+        } catch (RuntimeException e) {
+            started.set(false);
+            threadExecutor.shutdownNow();
+            throw e;
+        }
+        singleClientMetrics.register();
+        multiClientMetrics.register();
+    }
+
+    private boolean isActiveMode(final boolean multiClient) {
+        return started.get() && getMultiClient() == multiClient;
+    }
+
+    private void refreshBufferSize() {
+        int configuredSize = getLogCollectConfig().getBufferQueueSize();
+        if (configuredSize <= 0) {
+            throw new IllegalArgumentException("bufferQueueSize must be positive");
+        }
+        bufferSize = configuredSize;
+    }
+
+    @Override
+    public void collect(final L log) {
+        if (!started.get() || Objects.isNull(log) || Objects.isNull(getLogConsumeClient(log.getSelectorId()))) {
+            return;
+        }
+        if (getMultiClient()) {
+            String selectorId = log.getSelectorId();
+            BlockingQueue<L> bufferQueue = bufferQueueS.computeIfAbsent(selectorId, bufferQueueS -> initQueue(selectorId));
+            multiClientMetrics.recordAdmission(bufferQueue.offer(log));
+        } else {
+            BlockingQueue<L> queue = bufferQueue;
+            boolean admitted;
+            synchronized (queue) {
+                // On shrink, retain the backlog but reject new logs until it falls below the new limit.
+                admitted = queue.size() < bufferSize && queue.offer(log);
+            }
+            singleClientMetrics.recordAdmission(admitted);
+        }
+    }
+
+    @Override
+    public void desensitize(final L logInfo, final KeyWordMatch keyWordMatch, final String desensitizeAlg) {
+        this.desensitizeShenyuRequestLog(logInfo, keyWordMatch, desensitizeAlg);
+        this.desensitizeLog(logInfo, keyWordMatch, desensitizeAlg);
+    }
+
+    /**
+     * batch and async consume.
+     */
+    private void consume(final ThreadPoolExecutor consumerExecutor) {
+        while (!consumerExecutor.isShutdown()) {
+            int diffTimeMSForPush = 100;
+            try {
+                List<L> logs = new ArrayList<>();
+                int batchSize = 100;
+                if (getMultiClient()) {
+                    processMultiClientBufferQueues(batchSize, diffTimeMSForPush);
+                } else {
+                    processBufferQueue(bufferQueue, batchSize, diffTimeMSForPush, logs, lastPushTime);
+                }
+            } catch (Throwable t) {
+                LOG.error("DefaultLogCollector collect log error", t);
+                ThreadUtils.sleep(TimeUnit.MILLISECONDS, diffTimeMSForPush);
+            }
+        }
+    }
+
+    void processMultiClientBufferQueues(final int batchSize, final int diffTimeMSForPush) {
+        bufferQueueS.forEach((selectorId, bufferQueue) -> {
+            List<L> logs = new ArrayList<>();
+            Long lastPushTime = lastPushTimeS.get(selectorId);
+            try {
+                processBufferQueue(bufferQueue, batchSize, diffTimeMSForPush, logs, lastPushTime, selectorId);
+            } catch (Exception e) {
+                LOG.error("Log collector failed to consume logs for selector {}", selectorId, e);
+            }
+        });
+    }
+
+    private BlockingQueue<L> initQueue(final String selectorId) {
+        int capacity = getLogCollectConfig().getBufferQueueSize();
+        BlockingQueue<L> queue = new LinkedBlockingDeque<>(capacity);
+        lastPushTimeS.put(selectorId, System.currentTimeMillis());
+        multiBufferCapacity.addAndGet(capacity);
+        return queue;
+    }
+
+    private void processBufferQueue(final BlockingQueue<L> bufferQueue, final int batchSize,
+                                    final int diffTimeMSForPush, final List<L> logs,
+                                    final Long lastPushTime, final String selectorId) throws Exception {
+        int size = bufferQueue.size();
+        long time = System.currentTimeMillis();
+        long timeDiffMs = time - lastPushTime;
+
+        if (size >= batchSize || timeDiffMs > diffTimeMSForPush) {
+            bufferQueue.drainTo(logs, batchSize);
+            AbstractLogConsumeClient<?, L> logCollectClient = getLogConsumeClient(selectorId);
+            if (Objects.nonNull(logCollectClient)) {
+                logCollectClient.consume(logs);
+            }
+            lastPushTimeS.put(selectorId, time);
+        } else {
+            ThreadUtils.sleep(TimeUnit.MILLISECONDS, diffTimeMSForPush);
+        }
+    }
+
+    private void processBufferQueue(final BlockingQueue<L> bufferQueue, final int batchSize,
+                                    final int diffTimeMSForPush, final List<L> logs,
+                                    final Long lastPushTime) throws Exception {
+        int size = bufferQueue.size();
+        long time = System.currentTimeMillis();
+        long timeDiffMs = time - lastPushTime;
+
+        if (size >= batchSize || timeDiffMs > diffTimeMSForPush) {
+            bufferQueue.drainTo(logs, batchSize);
+            AbstractLogConsumeClient<?, L> logCollectClient = getLogConsumeClient();
+            if (Objects.nonNull(logCollectClient)) {
+                logCollectClient.consume(logs);
+            }
+            this.lastPushTime = time;
+        } else {
+            ThreadUtils.sleep(TimeUnit.MILLISECONDS, diffTimeMSForPush);
+        }
+    }
+
+    private void flushBufferQueues() throws Exception {
+        if (getMultiClient()) {
+            for (Map.Entry<String, BlockingQueue<L>> entry : bufferQueueS.entrySet()) {
+                flushBufferQueue(entry.getValue(), getLogConsumeClient(entry.getKey()));
+            }
+        } else {
+            flushBufferQueue(bufferQueue, getLogConsumeClient());
+        }
+    }
+
+    private void flushBufferQueue(final BlockingQueue<L> queue, final AbstractLogConsumeClient<?, L> logConsumeClient) throws Exception {
+        if (Objects.isNull(queue) || Objects.isNull(logConsumeClient)) {
+            return;
+        }
+        int batchSize = 100;
+        while (!queue.isEmpty()) {
+            List<L> logs = new ArrayList<>(batchSize);
+            queue.drainTo(logs, batchSize);
+            if (logs.isEmpty()) {
+                return;
+            }
+            logConsumeClient.consume(logs);
+        }
+    }
+
+    private void desensitizeShenyuRequestLog(final L logInfo, final KeyWordMatch keyWordMatch, final String desensitizedAlg) {
+        logInfo.setClientIp(desensitizeForSingleWord(GenericLoggingConstant.CLIENT_IP, logInfo.getClientIp(), keyWordMatch, desensitizedAlg));
+        logInfo.setTimeLocal(desensitizeForSingleWord(GenericLoggingConstant.TIME_LOCAL, logInfo.getTimeLocal(), keyWordMatch, desensitizedAlg));
+        logInfo.setMethod(desensitizeForSingleWord(GenericLoggingConstant.METHOD, logInfo.getMethod(), keyWordMatch, desensitizedAlg));
+        logInfo.setRequestUri(desensitizeForSingleWord(GenericLoggingConstant.REQUEST_URI, logInfo.getRequestUri(), keyWordMatch, desensitizedAlg));
+        if (Objects.nonNull(logInfo.getResponseContentLength())) {
+            logInfo.setResponseContentLength(Integer.valueOf(desensitizeForSingleWord(GenericLoggingConstant.RESPONSE_CONTENT_LENGTH,
+                    logInfo.getResponseContentLength().toString(), keyWordMatch, desensitizedAlg)));
+        }
+        logInfo.setRpcType(desensitizeForSingleWord(GenericLoggingConstant.RPC_TYPE, logInfo.getRpcType(), keyWordMatch, desensitizedAlg));
+        if (Objects.nonNull(logInfo.getStatus())) {
+            logInfo.setStatus(Integer.valueOf(desensitizeForSingleWord(GenericLoggingConstant.STATUS, logInfo.getStatus().toString(), keyWordMatch, desensitizedAlg)));
+        }
+        logInfo.setUpstreamIp(desensitizeForSingleWord(GenericLoggingConstant.UP_STREAM_IP, logInfo.getUpstreamIp(), keyWordMatch, desensitizedAlg));
+        if (Objects.nonNull(logInfo.getUpstreamResponseTime())) {
+            logInfo.setUpstreamResponseTime(Long.valueOf(desensitizeForSingleWord(GenericLoggingConstant.UP_STREAM_RESPONSE_TIME,
+                    logInfo.getUpstreamResponseTime().toString(), keyWordMatch, desensitizedAlg)));
+        }
+        logInfo.setUserAgent(desensitizeForSingleWord(GenericLoggingConstant.USERAGENT, logInfo.getUserAgent(), keyWordMatch, desensitizedAlg));
+        logInfo.setHost(desensitizeForSingleWord(GenericLoggingConstant.HOST, logInfo.getHost(), keyWordMatch, desensitizedAlg));
+        logInfo.setModule(desensitizeForSingleWord(GenericLoggingConstant.MODULE, logInfo.getModule(), keyWordMatch, desensitizedAlg));
+        logInfo.setTraceId(desensitizeForSingleWord(GenericLoggingConstant.TRACE_ID, logInfo.getTraceId(), keyWordMatch, desensitizedAlg));
+        logInfo.setPath(desensitizeForSingleWord(GenericLoggingConstant.PATH, logInfo.getPath(), keyWordMatch, desensitizedAlg));
+        logInfo.setRequestHeader(desensitizeForSingleWord(GenericLoggingConstant.REQUEST_HEADER, logInfo.getRequestHeader(), keyWordMatch, desensitizedAlg));
+        logInfo.setResponseHeader(desensitizeForSingleWord(GenericLoggingConstant.RESPONSE_HEADER, logInfo.getResponseHeader(),
+                keyWordMatch, desensitizedAlg));
+        logInfo.setQueryParams(desensitizeForSingleWord(GenericLoggingConstant.QUERY_PARAMS, logInfo.getQueryParams(), keyWordMatch, desensitizedAlg));
+        logInfo.setRequestBody(desensitizeForSingleWord(GenericLoggingConstant.REQUEST_BODY, logInfo.getRequestBody(), keyWordMatch, desensitizedAlg));
+        logInfo.setResponseBody(desensitizeForSingleWord(GenericLoggingConstant.RESPONSE_BODY, logInfo.getResponseBody(), keyWordMatch, desensitizedAlg));
+        logInfo.setRequestHeader(desensitizeForBody(logInfo.getRequestHeader(), keyWordMatch, desensitizedAlg));
+        logInfo.setResponseHeader(desensitizeForBody(logInfo.getResponseHeader(), keyWordMatch, desensitizedAlg));
+        logInfo.setQueryParams(desensitizeQueryParams(logInfo.getQueryParams(), keyWordMatch, desensitizedAlg));
+        logInfo.setRequestBody(desensitizeForBody(logInfo.getRequestBody(), keyWordMatch, desensitizedAlg));
+        logInfo.setResponseBody(desensitizeForBody(logInfo.getResponseBody(), keyWordMatch, desensitizedAlg));
+    }
+
+    /**
+     * get log consume client.
+     *
+     * @return log consume client
+     */
+    protected abstract T getLogConsumeClient();
+
+    /**
+     * get log consume client by selectorId.
+     *
+     * @return log consume client
+     */
+    protected T getLogConsumeClient(final String path) {
+        return getLogConsumeClient();
+    }
+
+    /**
+     * getMultiClient.
+     *
+     * @return multiClient
+     */
+    protected boolean getMultiClient() {
+        return false;
+    }
+
+    /**
+     * get log collect config.
+     *
+     * @return log collect config
+     */
+    protected abstract C getLogCollectConfig();
+
+    /**
+     * desensitize log.
+     *
+     * @param log            log
+     * @param keyWordMatch   keyWordMathc
+     * @param desensitizeAlg data desensitize algorithm
+     */
+    protected abstract void desensitizeLog(L log, KeyWordMatch keyWordMatch, String desensitizeAlg);
+
+    @Override
+    public synchronized void close() throws Exception {
+        started.set(false);
+        if (Objects.nonNull(executor)) {
+            executor.shutdownNow();
+        }
+        AbstractLogConsumeClient<?, ?> logCollectClient = getLogConsumeClient();
+        try {
+            flushBufferQueues();
+        } finally {
+            singleClientMetrics.unregister();
+            multiClientMetrics.unregister();
+            if (Objects.nonNull(logCollectClient)) {
+                logCollectClient.close();
+            }
+        }
+    }
+}

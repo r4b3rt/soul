@@ -1,0 +1,117 @@
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: docker-publish-ghcr
+
+on:
+  push:
+    branches: ["master"]
+    tags: ["v*.*.*"]
+    paths-ignore:
+      - '**.md'
+      - '**.txt'
+      - '**.png'
+      - '**.jpg'
+      - '**.jpeg'
+      - '**.gif'
+      - '**.svg'
+      - '**.ico'
+      - '**.pdf'
+      - '**.doc'
+      - '**.docx'
+      - 'LICENSE'
+      - 'NOTICE'
+      - 'DISCLAIMER'
+      - '.asf.yaml'
+      - '.gitignore'
+      - '.licenserc.yaml'
+      - '.github/**'
+      - 'actions/**'
+      - 'shenyu-e2e/**'
+      - 'shenyu-integrated-test/**'
+      - 'shenyu-examples/**'
+      - '**/resources/static/**'
+
+env:
+  REGISTRY: ghcr.io
+  REPOSITORY: ${{ github.repository }}
+  TAG: ${{ github.sha }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    if: (github.repository == 'apache/shenyu')
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+
+      - name: Set up Docker Buildx
+        id: buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Available platforms
+        run: echo ${{ steps.buildx.outputs.platforms }}
+
+      - uses: ./actions/setup-java-with-retry
+        with:
+          java-version: 17
+          distribution: "temurin"
+          cache: maven
+
+      - name: Build with Maven
+        shell: bash
+        run: |
+          ./mvnw -B -ntp -T 1C clean -Prelease -Dmaven.javadoc.skip=true -B -Drat.skip=true -Djacoco.skip=true -DskipITs -DskipTests package
+
+      - name: Build and push (admin) (ghcr.io)
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: ./shenyu-dist/shenyu-admin-dist
+          file: ./shenyu-dist/shenyu-admin-dist/docker/Dockerfile
+          build-args: APP_NAME=apache-shenyu-*-admin-bin
+          platforms: linux/amd64,linux/arm64
+          # Candidate tags still build images, but must not publish an unvoted release as latest.
+          push: ${{ github.ref_type != 'tag' || !contains(github.ref_name, '-') }}
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.REPOSITORY }}/admin:latest
+            ${{ env.REGISTRY }}/${{ env.REPOSITORY }}/admin:${{ env.TAG }}
+
+      - name: Build and push (bootstrap) (ghcr.io)
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: ./shenyu-dist/shenyu-bootstrap-dist
+          file: ./shenyu-dist/shenyu-bootstrap-dist/docker/Dockerfile
+          build-args: APP_NAME=apache-shenyu-*-bootstrap-bin
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.ref_type != 'tag' || !contains(github.ref_name, '-') }}
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.REPOSITORY }}/bootstrap:latest
+            ${{ env.REGISTRY }}/${{ env.REPOSITORY }}/bootstrap:${{ env.TAG }}

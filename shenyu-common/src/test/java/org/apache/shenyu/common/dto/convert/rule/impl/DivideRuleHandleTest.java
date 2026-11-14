@@ -1,0 +1,108 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.shenyu.common.dto.convert.rule.impl;
+
+import com.google.common.collect.ImmutableSet;
+import org.apache.shenyu.common.dto.convert.rule.canary.CanaryConfig;
+import org.apache.shenyu.common.enums.HttpRetryBackoffSpecEnum;
+import org.apache.shenyu.common.enums.LoadBalanceEnum;
+import org.apache.shenyu.common.enums.RetryEnum;
+import org.junit.jupiter.api.Test;
+
+import java.util.Map;
+
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.hamcrest.MatcherAssert.assertThat;
+import static org.hamcrest.Matchers.hasSize;
+import static org.hamcrest.core.Is.is;
+
+/**
+ * Test case for DivideRuleHandle.
+ */
+public class DivideRuleHandleTest {
+    
+    @Test
+    public void testGetterSetter() {
+        DivideRuleHandle handle = new DivideRuleHandle();
+        
+        handle.setLoadBalance(LoadBalanceEnum.HASH.getName());
+        handle.setRetryStrategy(RetryEnum.FAILOVER.getName());
+        handle.setRetryBackOffSpec(HttpRetryBackoffSpecEnum.FIXED_BACKOFF.getName());
+        handle.setRetry(1);
+        handle.setTimeout(1000L);
+        handle.setHeaderMaxSize(100L);
+        handle.setRequestMaxSize(200L);
+        
+        assertThat(handle.getLoadBalance(), is(LoadBalanceEnum.HASH.getName()));
+        assertThat(handle.getRetryStrategy(), is(RetryEnum.FAILOVER.getName()));
+        assertThat(handle.getRetryBackOffSpec(), is(HttpRetryBackoffSpecEnum.FIXED_BACKOFF.getName()));
+        assertThat(handle.getRetry(), is(1));
+        assertThat(handle.getTimeout(), is(1000L));
+        assertThat(handle.getHeaderMaxSize(), is(100L));
+        assertThat(handle.getRequestMaxSize(), is(200L));
+    }
+    
+    @Test
+    public void testEqualsAndHashCode() {
+        DivideRuleHandle handle1 = new DivideRuleHandle();
+        DivideRuleHandle handle2 = new DivideRuleHandle();
+        
+        assertThat(ImmutableSet.of(handle1, handle2), hasSize(1));
+    }
+    
+    @Test
+    public void testCanaryConfigurationEquality() {
+        final DivideRuleHandle handle1 = new DivideRuleHandle();
+        final DivideRuleHandle handle2 = new DivideRuleHandle();
+        CanaryConfig canary1 = new CanaryConfig();
+        CanaryConfig canary2 = new CanaryConfig();
+        canary1.setEnabled(true);
+        canary1.setPercentage(10);
+        canary2.setEnabled(true);
+        canary2.setPercentage(10);
+        handle1.setCanary(canary1);
+        handle2.setCanary(canary2);
+
+        assertThat(handle1.getCanary(), is(canary1));
+        assertThat(ImmutableSet.of(handle1, handle2), hasSize(1));
+
+        canary2.setPercentage(20);
+        assertThat(handle1.equals(handle2), is(false));
+        assertThat(ImmutableSet.of(handle1, handle2), hasSize(2));
+
+        handle2.setCanary(null);
+        assertThat(handle1.equals(handle2), is(false));
+    }
+
+    @Test
+    public void testPartitionLabelsMustBeMutuallyExclusive() {
+        CanaryConfig config = new CanaryConfig();
+        assertThrows(IllegalArgumentException.class, config::validatePartitionLabels);
+        config.setCanaryLabels(Map.of("release", "canary"));
+        config.setStableLabels(Map.of("release", "stable"));
+        assertDoesNotThrow(config::validatePartitionLabels);
+        config.setStableLabels(Map.of("release", "canary"));
+        assertThrows(IllegalArgumentException.class, config::validatePartitionLabels);
+        config.setStableLabels(Map.of("region", "east"));
+        assertThrows(IllegalArgumentException.class, config::validatePartitionLabels);
+        config.setStableLabels(Map.of("release", "stable", "region", "east"));
+        assertDoesNotThrow(config::validatePartitionLabels);
+    }
+
+}

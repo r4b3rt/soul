@@ -1,0 +1,301 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.shenyu.admin.service;
+
+import org.apache.shenyu.admin.mapper.NamespacePluginRelMapper;
+import org.apache.shenyu.admin.mapper.PluginHandleMapper;
+import org.apache.shenyu.admin.mapper.PluginMapper;
+import org.apache.shenyu.admin.mapper.SelectorMapper;
+import org.apache.shenyu.admin.model.entity.PluginDO;
+import org.apache.shenyu.admin.model.entity.PluginHandleDO;
+import org.apache.shenyu.admin.model.entity.SelectorDO;
+import org.apache.shenyu.admin.model.vo.NamespacePluginVO;
+import org.apache.shenyu.admin.utils.ShenyuResultMessage;
+import org.apache.shenyu.admin.model.dto.NamespacePluginDTO;
+import org.apache.shenyu.admin.exception.ShenyuAdminException;
+import org.apache.shenyu.admin.model.vo.PluginSnapshotVO;
+import org.apache.shenyu.admin.service.impl.NamespacePluginServiceImpl;
+import org.apache.shenyu.admin.service.publish.NamespacePluginEventPublisher;
+import org.junit.jupiter.api.Assertions;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.InjectMocks;
+import org.mockito.Mock;
+import org.mockito.Mockito;
+import org.mockito.junit.jupiter.MockitoExtension;
+import org.mockito.junit.jupiter.MockitoSettings;
+import org.mockito.quality.Strictness;
+
+import java.util.ArrayList;
+import java.util.List;
+
+@ExtendWith(MockitoExtension.class)
+@MockitoSettings(strictness = Strictness.LENIENT)
+public final class NamespacePluginServiceTest {
+
+    @InjectMocks
+    private NamespacePluginServiceImpl namespacePluginService;
+
+    @Mock
+    private NamespacePluginRelMapper namespacePluginRelMapper;
+
+    @Mock
+    private SelectorMapper selectorMapper;
+
+    @Mock
+    private PluginHandleMapper pluginHandleMapper;
+
+    @Mock
+    private PluginMapper pluginMapper;
+
+    @Mock
+    private NamespacePluginEventPublisher namespacePluginEventPublisher;
+
+    @Test
+    public void testCreatePublishesCreatedEvent() {
+        String namespaceId = "namespaceId";
+        String pluginId = "pluginId";
+        PluginDO pluginDO = Mockito.mock(PluginDO.class);
+        NamespacePluginVO created = Mockito.mock(NamespacePluginVO.class);
+        Mockito.when(pluginDO.getId()).thenReturn(pluginId);
+        Mockito.when(pluginMapper.selectById(pluginId)).thenReturn(pluginDO);
+        Mockito.when(namespacePluginRelMapper.insertSelective(Mockito.any())).thenReturn(1);
+        Mockito.when(namespacePluginRelMapper.selectByPluginIdAndNamespaceId(pluginId, namespaceId))
+                .thenReturn(null, created);
+
+        NamespacePluginVO result = namespacePluginService.create(namespaceId, pluginId);
+
+        Assertions.assertSame(created, result);
+        Mockito.verify(namespacePluginEventPublisher).onCreated(created);
+    }
+
+    @Test
+    public void testRejectsInvalidAgentConfigBeforeNamespacePersistence() {
+        var dto = new NamespacePluginDTO();
+        dto.setId("agent-id");
+        dto.setNamespaceId("namespace-a");
+        dto.setName("other-name");
+        dto.setConfig("{\"unknown\":\"SECRET\"}");
+        NamespacePluginVO stored = Mockito.mock(NamespacePluginVO.class);
+        Mockito.when(stored.getName()).thenReturn("agentGateway");
+        Mockito.when(stored.getNamespaceId()).thenReturn("namespace-a");
+        Mockito.when(namespacePluginRelMapper.selectById("agent-id")).thenReturn(stored);
+        Assertions.assertThrows(ShenyuAdminException.class, () -> namespacePluginService.update(dto));
+        Mockito.verify(namespacePluginRelMapper, Mockito.never()).updateSelective(Mockito.any());
+        Mockito.verifyNoInteractions(namespacePluginEventPublisher);
+    }
+
+    @Test
+    public void testAcceptsExplicitEmptyAgentConfigAndPublishesUpdate() {
+        var dto = new NamespacePluginDTO();
+        dto.setId("agent-id");
+        dto.setNamespaceId("namespace-a");
+        dto.setName("agentGateway");
+        dto.setConfig("{}");
+        NamespacePluginVO stored = Mockito.mock(NamespacePluginVO.class);
+        Mockito.when(stored.getName()).thenReturn("agentGateway");
+        Mockito.when(stored.getNamespaceId()).thenReturn("namespace-a");
+        Mockito.when(namespacePluginRelMapper.selectById("agent-id")).thenReturn(stored);
+        Mockito.when(namespacePluginRelMapper.updateSelective(Mockito.any())).thenReturn(1);
+        namespacePluginService.update(dto);
+        Mockito.verify(namespacePluginEventPublisher).onUpdated(stored, stored);
+    }
+
+    @Test
+    public void testCreateDoesNotPublishWhenInsertFails() {
+        String namespaceId = "namespaceId";
+        String pluginId = "pluginId";
+        PluginDO pluginDO = Mockito.mock(PluginDO.class);
+        Mockito.when(pluginDO.getId()).thenReturn(pluginId);
+        Mockito.when(pluginMapper.selectById(pluginId)).thenReturn(pluginDO);
+        Mockito.when(namespacePluginRelMapper.insertSelective(Mockito.any())).thenReturn(0);
+
+        NamespacePluginVO result = namespacePluginService.create(namespaceId, pluginId);
+
+        Assertions.assertNull(result);
+        Mockito.verify(namespacePluginEventPublisher, Mockito.never()).onCreated(Mockito.any(NamespacePluginVO.class));
+        Mockito.verify(namespacePluginRelMapper).selectByPluginIdAndNamespaceId(pluginId, namespaceId);
+    }
+
+    @Test
+    public void testActivePluginSnapshot() {
+        String namespaceId = "testNamespaceId";
+        String pluginId1 = "pluginId1";
+
+        // mock plugin
+        NamespacePluginVO mockPlugin1 = Mockito.mock(NamespacePluginVO.class);
+        Mockito.when(mockPlugin1.getPluginId()).thenReturn(pluginId1);
+        Mockito.when(mockPlugin1.getEnabled()).thenReturn(true);
+        List<NamespacePluginVO> namespacePluginVOList = List.of(
+                mockPlugin1
+        );
+        Mockito.when(namespacePluginRelMapper.selectByNamespaceId(namespaceId)).thenReturn(namespacePluginVOList);
+
+        // mock selector
+        SelectorDO mockSelector1 = Mockito.mock(SelectorDO.class);
+        Mockito.when(mockSelector1.getPluginId()).thenReturn(pluginId1);
+        List<SelectorDO> selectorDOList = List.of(
+                mockSelector1
+        );
+        Mockito.when(selectorMapper.selectAllByNamespaceId(namespaceId)).thenReturn(selectorDOList);
+
+        // mock plugin handler
+        PluginHandleDO mockPluginHandle1 = Mockito.mock(PluginHandleDO.class);
+        Mockito.when(mockPluginHandle1.getPluginId()).thenReturn(pluginId1);
+        List<PluginHandleDO> pluginHandleDOList = List.of(
+                mockPluginHandle1
+        );
+        Mockito.when(pluginHandleMapper.selectByPluginIdList(List.of(pluginId1))).thenReturn(pluginHandleDOList);
+
+        // test
+        List<PluginSnapshotVO> result = namespacePluginService.activePluginSnapshot(namespaceId);
+
+        // verify
+        Assertions.assertEquals(1, result.size());
+        PluginSnapshotVO pluginSnapshotVO = result.get(0);
+        Assertions.assertEquals(pluginId1, pluginSnapshotVO.getId());
+    }
+
+    @Test
+    public void testActivePluginSnapshotEmpty() {
+        String namespaceId = "testNamespaceId";
+
+        // mock plugin is empty
+        Mockito.when(namespacePluginRelMapper.selectByNamespaceId(namespaceId)).thenReturn(new ArrayList<>());
+
+        // test
+        List<PluginSnapshotVO> result = namespacePluginService.activePluginSnapshot(namespaceId);
+
+        // verify
+        Assertions.assertEquals(0, result.size());
+    }
+
+    @Test
+    public void testActivePluginSnapshotEmptyEnabled() {
+        String namespaceId = "testNamespaceId";
+        String pluginId1 = "pluginId1";
+
+        // mock plugin not enabled
+        NamespacePluginVO mockPlugin1 = Mockito.mock(NamespacePluginVO.class);
+        Mockito.when(mockPlugin1.getPluginId()).thenReturn(pluginId1);
+        Mockito.when(mockPlugin1.getEnabled()).thenReturn(false);
+        List<NamespacePluginVO> namespacePluginVOList = List.of(mockPlugin1);
+        Mockito.when(namespacePluginRelMapper.selectByNamespaceId(namespaceId)).thenReturn(namespacePluginVOList);
+
+        // test
+        List<PluginSnapshotVO> result = namespacePluginService.activePluginSnapshot(namespaceId);
+
+        // verify
+        Assertions.assertEquals(0, result.size());
+    }
+
+    @Test
+    public void testUpdateRejectsRelationFromAnotherNamespace() {
+        NamespacePluginDTO dto = new NamespacePluginDTO();
+        dto.setId("rel-1");
+        dto.setNamespaceId("namespace-a");
+        dto.setPluginId("pluginId");
+        NamespacePluginVO before = Mockito.mock(NamespacePluginVO.class);
+        Mockito.when(before.getNamespaceId()).thenReturn("namespace-b");
+        Mockito.when(namespacePluginRelMapper.selectById("rel-1")).thenReturn(before);
+
+        Assertions.assertThrows(ShenyuAdminException.class, () -> namespacePluginService.update(dto));
+        Mockito.verify(namespacePluginRelMapper, Mockito.never()).updateSelective(Mockito.any());
+    }
+
+    @Test
+    public void testUpdateRejectsUnknownRelation() {
+        NamespacePluginDTO dto = new NamespacePluginDTO();
+        dto.setId("missing-rel");
+        dto.setNamespaceId("namespace-a");
+        dto.setPluginId("pluginId");
+        Mockito.when(namespacePluginRelMapper.selectById("missing-rel")).thenReturn(null);
+
+        Assertions.assertThrows(ShenyuAdminException.class, () -> namespacePluginService.update(dto));
+        Mockito.verify(namespacePluginRelMapper, Mockito.never()).updateSelective(Mockito.any());
+    }
+
+    @Test
+    public void testUpdateAcceptsRelationFromSameNamespace() {
+        NamespacePluginDTO dto = new NamespacePluginDTO();
+        dto.setId("rel-1");
+        dto.setNamespaceId("namespace-a");
+        dto.setPluginId("pluginId");
+        NamespacePluginVO before = Mockito.mock(NamespacePluginVO.class);
+        Mockito.when(before.getNamespaceId()).thenReturn("namespace-a");
+        NamespacePluginVO after = Mockito.mock(NamespacePluginVO.class);
+        Mockito.when(namespacePluginRelMapper.selectById("rel-1")).thenReturn(before, after);
+        Mockito.when(namespacePluginRelMapper.updateSelective(Mockito.any())).thenReturn(1);
+
+        Assertions.assertEquals(ShenyuResultMessage.UPDATE_SUCCESS, namespacePluginService.update(dto));
+        Mockito.verify(namespacePluginEventPublisher).onUpdated(after, before);
+    }
+
+    @Test
+    public void testDeleteScopedToRequestNamespace() {
+        NamespacePluginVO own = Mockito.mock(NamespacePluginVO.class);
+        Mockito.when(own.getId()).thenReturn("rel-own");
+        Mockito.when(own.getNamespaceId()).thenReturn("namespace-a");
+        NamespacePluginVO foreign = Mockito.mock(NamespacePluginVO.class);
+        Mockito.when(foreign.getId()).thenReturn("rel-foreign");
+        Mockito.when(foreign.getNamespaceId()).thenReturn("namespace-b");
+        Mockito.when(namespacePluginRelMapper.selectByIds(Mockito.anyList()))
+                .thenReturn(java.util.Arrays.asList(own, foreign));
+        Mockito.when(namespacePluginRelMapper.deleteByIds(Mockito.anyList())).thenReturn(1);
+
+        String result = namespacePluginService.delete(java.util.Arrays.asList("rel-own", "rel-foreign"), "namespace-a");
+
+        Assertions.assertEquals(org.apache.commons.lang3.StringUtils.EMPTY, result);
+        Mockito.verify(namespacePluginRelMapper).deleteByIds(java.util.Collections.singletonList("rel-own"));
+        Mockito.verify(namespacePluginEventPublisher).onDeleted(java.util.Collections.singletonList(own));
+    }
+
+    @Test
+    public void testEnabledScopedToRequestNamespace() {
+        NamespacePluginVO own = Mockito.mock(NamespacePluginVO.class);
+        Mockito.when(own.getId()).thenReturn("rel-own");
+        Mockito.when(own.getNamespaceId()).thenReturn("namespace-a");
+        NamespacePluginVO foreign = Mockito.mock(NamespacePluginVO.class);
+        Mockito.when(foreign.getId()).thenReturn("rel-foreign");
+        Mockito.when(foreign.getNamespaceId()).thenReturn("namespace-b");
+        Mockito.when(namespacePluginRelMapper.selectByIds(Mockito.anyList()))
+                .thenReturn(java.util.Arrays.asList(own, foreign));
+
+        String result = namespacePluginService.enabled(java.util.Arrays.asList("rel-own", "rel-foreign"), false, "namespace-a");
+
+        Assertions.assertEquals(org.apache.commons.lang3.StringUtils.EMPTY, result);
+        Mockito.verify(namespacePluginRelMapper).updateEnableByIdList(java.util.Collections.singletonList("rel-own"), false);
+        Mockito.verify(namespacePluginEventPublisher).onEnabled(java.util.Collections.singletonList(own));
+        Mockito.verify(foreign, Mockito.never()).setEnabled(Mockito.any());
+    }
+
+    @Test
+    public void testEnabledRejectsForeignNamespaceOnly() {
+        NamespacePluginVO foreign = Mockito.mock(NamespacePluginVO.class);
+        Mockito.when(foreign.getId()).thenReturn("rel-foreign");
+        Mockito.when(foreign.getNamespaceId()).thenReturn("namespace-b");
+        Mockito.when(namespacePluginRelMapper.selectByIds(Mockito.anyList()))
+                .thenReturn(java.util.Collections.singletonList(foreign));
+
+        String result = namespacePluginService.enabled(java.util.Collections.singletonList("rel-foreign"), false, "namespace-a");
+
+        Assertions.assertEquals(org.apache.shenyu.common.constant.AdminConstants.SYS_PLUGIN_ID_NOT_EXIST, result);
+        Mockito.verify(namespacePluginRelMapper, Mockito.never()).updateEnableByIdList(Mockito.anyList(), Mockito.any());
+        Mockito.verify(namespacePluginEventPublisher, Mockito.never()).onEnabled(Mockito.anyList());
+    }
+}

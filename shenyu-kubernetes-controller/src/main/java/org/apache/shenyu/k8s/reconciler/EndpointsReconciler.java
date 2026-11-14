@@ -1,0 +1,224 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.shenyu.k8s.reconciler;
+
+import io.kubernetes.client.extended.controller.reconciler.Reconciler;
+import io.kubernetes.client.extended.controller.reconciler.Request;
+import io.kubernetes.client.extended.controller.reconciler.Result;
+import io.kubernetes.client.informer.SharedIndexInformer;
+import io.kubernetes.client.informer.cache.Lister;
+import io.kubernetes.client.openapi.ApiClient;
+import io.kubernetes.client.openapi.models.CoreV1EndpointPort;
+import io.kubernetes.client.openapi.models.V1EndpointAddress;
+import io.kubernetes.client.openapi.models.V1EndpointSubset;
+import io.kubernetes.client.openapi.models.V1Endpoints;
+import io.kubernetes.client.openapi.models.V1Ingress;
+import org.apache.commons.collections4.CollectionUtils;
+import org.apache.commons.lang3.tuple.Pair;
+import org.apache.shenyu.common.dto.SelectorData;
+import org.apache.shenyu.common.dto.convert.selector.DivideUpstream;
+import org.apache.shenyu.common.dto.convert.selector.WebSocketUpstream;
+import org.apache.shenyu.common.enums.PluginEnum;
+import org.apache.shenyu.common.utils.GsonUtils;
+import org.apache.shenyu.k8s.cache.IngressSelectorCache;
+import org.apache.shenyu.k8s.cache.ServiceIngressCache;
+import org.apache.shenyu.k8s.common.IngressUtils;
+import org.apache.shenyu.k8s.common.IngressBackendPort;
+import org.apache.shenyu.k8s.common.ServiceIngressRelation;
+import org.apache.shenyu.k8s.repository.ShenyuCacheRepository;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Objects;
+import java.util.Set;
+
+/**
+ * The Reconciler of Endpoints.
+ */
+public class EndpointsReconciler implements Reconciler {
+
+    private static final Logger LOG = LoggerFactory.getLogger(EndpointsReconciler.class);
+
+    private static final Set<String> ENDPOINT_UPSTREAM_PLUGINS = new HashSet<>(Arrays.asList(PluginEnum.DIVIDE.getName(), PluginEnum.WEB_SOCKET.getName()));
+
+    private final Lister<V1Ingress> ingressLister;
+
+    private final Lister<V1Endpoints> endpointsLister;
+
+    private final ShenyuCacheRepository shenyuCacheRepository;
+
+    private final ApiClient apiClient;
+
+    /**
+     * EndpointsReconciler Constructor.
+     *
+     * @param ingressInformer       ingressInformer
+     * @param endpointsInformer     endpointsInformer
+     * @param shenyuCacheRepository shenyuCacheRepository
+     * @param apiClient             apiClient
+     */
+    public EndpointsReconciler(final SharedIndexInformer<V1Ingress> ingressInformer,
+                               final SharedIndexInformer<V1Endpoints> endpointsInformer,
+                               final ShenyuCacheRepository shenyuCacheRepository,
+                               final ApiClient apiClient) {
+        this.ingressLister = new Lister<>(ingressInformer.getIndexer());
+        this.endpointsLister = new Lister<>(endpointsInformer.getIndexer());
+        this.shenyuCacheRepository = shenyuCacheRepository;
+        this.apiClient = apiClient;
+    }
+
+    /**
+     * Reconcile cycle.
+     *
+     * @param request request
+     * @return reconcile result
+     */
+    @Override
+    public Result reconcile(final Request request) {
+        List<ServiceIngressRelation> ingressList = ServiceIngressCache.getInstance().getIngressName(request.getNamespace(), request.getName());
+        if (CollectionUtils.isEmpty(ingressList)) {
+            return new Result(false);
+        }
+
+        V1Endpoints v1Endpoints = endpointsLister.namespace(request.getNamespace()).get(request.getName());
+        if (Objects.isNull(v1Endpoints)) {
+            // The deletion event is not processed, because deleting all upstreams in the Selector has
+            // the same effect as not deleting them, and they cannot be accessed
+            LOG.info("Cannot find endpoints {}", request);
+            return new Result(false);
+        }
+
+        updateSelectors(ingressList, v1Endpoints, PluginEnum.DIVIDE.getName());
+        updateSelectors(ingressList, v1Endpoints, PluginEnum.WEB_SOCKET.getName());
+        LOG.info("Update selector for endpoint {}", request);
+
+        return new Result(false);
+    }
+
+    private void updateSelectors(final List<ServiceIngressRelation> ingressList, final V1Endpoints v1Endpoints, final String pluginName) {
+        if (!ENDPOINT_UPSTREAM_PLUGINS.contains(pluginName)) {
+            return;
+        }
+        List<SelectorData> totalSelectors = shenyuCacheRepository.findSelectorDataList(pluginName);
+        if (CollectionUtils.isEmpty(totalSelectors)) {
+            return;
+        }
+        for (ServiceIngressRelation relation : ingressList) {
+            List<String> selectorIdList = IngressSelectorCache.getInstance()
+                    .get(relation.getIngressNamespace(), relation.getIngressName(), pluginName);
+            if (CollectionUtils.isEmpty(selectorIdList)) {
+                continue;
+            }
+            // each ingress selects its own service port, so the upstream handle of an ingress must
+            // be rebuilt with the endpoints of that port
+            V1Ingress ingress = ingressLister.namespace(relation.getIngressNamespace()).get(relation.getIngressName());
+            String handle = getUpstreamHandle(endpointAddresses(v1Endpoints, relation.getPort()), pluginName, ingress);
+            if (Objects.isNull(handle)) {
+                LOG.info("Cannot find endpoint addresses of the backend port {} for ingress {}/{}",
+                        relation.getPort(), relation.getIngressNamespace(), relation.getIngressName());
+                continue;
+            }
+            totalSelectors.forEach(selectorData -> {
+                if (selectorIdList.contains(selectorData.getId())) {
+                    SelectorData newSelectorData = SelectorData.builder().id(selectorData.getId())
+                            .pluginId(selectorData.getPluginId())
+                            .pluginName(selectorData.getPluginName())
+                            .name(selectorData.getName())
+                            .matchMode(selectorData.getMatchMode())
+                            .type(selectorData.getType())
+                            .sort(selectorData.getSort())
+                            .enabled(selectorData.getEnabled())
+                            .logged(selectorData.getLogged())
+                            .continued(selectorData.getContinued())
+                            .handle(handle)
+                            .conditionList(selectorData.getConditionList())
+                            .matchRestful(selectorData.getMatchRestful()).build();
+                    shenyuCacheRepository.saveOrUpdateSelectorData(newSelectorData);
+                }
+            });
+        }
+    }
+
+    private String getUpstreamHandle(final List<Pair<V1EndpointAddress, String>> addresses, final String pluginName, final V1Ingress ingress) {
+        if (CollectionUtils.isEmpty(addresses)) {
+            return null;
+        }
+        if (PluginEnum.WEB_SOCKET.getName().equals(pluginName)) {
+            List<WebSocketUpstream> res = new ArrayList<>();
+            addresses.forEach(pair -> res.add(WebSocketUpstream.builder()
+                    .upstreamUrl(pair.getLeft().getIp() + ":" + pair.getRight())
+                    .weight(100)
+                    .protocol("ws://")
+                    .warmup(0)
+                    .status(true)
+                    .host("")
+                    .build()));
+            return GsonUtils.getInstance().toJson(res);
+        }
+        List<DivideUpstream> res = new ArrayList<>();
+        for (int i = 0; i < addresses.size(); i++) {
+            Pair<V1EndpointAddress, String> pair = addresses.get(i);
+            DivideUpstream upstream = new DivideUpstream();
+            upstream.setUpstreamUrl(pair.getLeft().getIp() + ":" + pair.getRight());
+            upstream.setWeight(100);
+            upstream.setProtocol(IngressUtils.getUpstreamProtocol(Objects.isNull(ingress) ? null : ingress.getMetadata().getAnnotations(), i, "http://"));
+            upstream.setWarmup(0);
+            upstream.setStatus(true);
+            upstream.setUpstreamHost("");
+            res.add(upstream);
+        }
+        return GsonUtils.getInstance().toJson(res);
+    }
+
+    private List<Pair<V1EndpointAddress, String>> endpointAddresses(final V1Endpoints v1Endpoints, final IngressBackendPort backendPort) {
+        List<Pair<V1EndpointAddress, String>> res = new ArrayList<>();
+        List<V1EndpointSubset> subsets = v1Endpoints.getSubsets();
+        if (CollectionUtils.isNotEmpty(subsets)) {
+            for (V1EndpointSubset subset : subsets) {
+                List<CoreV1EndpointPort> ports = subset.getPorts();
+                List<V1EndpointAddress> addresses = subset.getAddresses();
+                if (CollectionUtils.isEmpty(ports) || CollectionUtils.isEmpty(addresses)) {
+                    continue;
+                }
+                CoreV1EndpointPort endpointPort = IngressBackendPort.selectEndpointPort(ports, backendPort);
+                if (Objects.isNull(endpointPort)) {
+                    continue;
+                }
+                String port = null;
+                if (endpointPort.getPort() > 0) {
+                    port = String.valueOf(endpointPort.getPort());
+                } else {
+                    String endpointPortName = endpointPort.getName();
+                    if (Objects.nonNull(endpointPortName)) {
+                        port = endpointPortName;
+                    }
+                }
+                for (V1EndpointAddress address : addresses) {
+                    if (Objects.nonNull(address.getIp()) && Objects.nonNull(port)) {
+                        res.add(Pair.of(address, port));
+                    }
+                }
+            }
+        }
+        return res;
+    }
+}

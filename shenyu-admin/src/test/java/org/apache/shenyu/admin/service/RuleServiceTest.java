@@ -1,0 +1,1119 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.shenyu.admin.service;
+
+import com.github.pagehelper.Page;
+import com.github.pagehelper.PageInfo;
+import com.google.common.collect.Lists;
+import com.google.common.collect.Sets;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
+import org.apache.commons.lang3.StringUtils;
+import org.apache.shenyu.admin.exception.ShenyuAdminException;
+import org.apache.shenyu.admin.mapper.DataPermissionMapper;
+import org.apache.shenyu.admin.mapper.PluginMapper;
+import org.apache.shenyu.admin.mapper.RuleConditionMapper;
+import org.apache.shenyu.admin.mapper.RuleMapper;
+import org.apache.shenyu.admin.mapper.SelectorMapper;
+import org.apache.shenyu.admin.mapper.ShenyuDictMapper;
+import org.apache.shenyu.admin.model.custom.UserInfo;
+import org.apache.shenyu.admin.model.dto.DataPermissionDTO;
+import org.apache.shenyu.admin.model.dto.RuleConditionDTO;
+import org.apache.shenyu.admin.model.dto.RuleDTO;
+import org.apache.shenyu.admin.model.entity.DataPermissionDO;
+import org.apache.shenyu.admin.model.entity.PluginDO;
+import org.apache.shenyu.admin.model.entity.RuleConditionDO;
+import org.apache.shenyu.admin.model.entity.RuleDO;
+import org.apache.shenyu.admin.model.entity.SelectorDO;
+import org.apache.shenyu.admin.model.entity.ShenyuDictDO;
+import org.apache.shenyu.admin.model.page.CommonPager;
+import org.apache.shenyu.admin.model.page.PageCondition;
+import org.apache.shenyu.admin.model.page.PageParameter;
+import org.apache.shenyu.admin.model.query.RuleConditionQuery;
+import org.apache.shenyu.admin.model.query.RuleQuery;
+import org.apache.shenyu.admin.model.query.RuleQueryCondition;
+import org.apache.shenyu.admin.model.result.ConfigImportResult;
+import org.apache.shenyu.admin.model.vo.RuleVO;
+import org.apache.shenyu.admin.service.configs.ConfigsImportContext;
+import org.apache.shenyu.admin.service.impl.RuleServiceImpl;
+import org.apache.shenyu.admin.service.permission.PluginDataPermissionChecker;
+import org.apache.shenyu.admin.service.publish.RuleEventPublisher;
+import org.apache.shenyu.admin.utils.JwtUtils;
+import org.apache.shenyu.common.dto.RuleData;
+import org.apache.shenyu.common.enums.PluginEnum;
+import org.apache.shiro.authz.UnauthorizedException;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
+import org.mockito.ArgumentCaptor;
+import org.mockito.InjectMocks;
+import org.mockito.Mock;
+import org.mockito.MockedStatic;
+import org.mockito.junit.jupiter.MockitoExtension;
+import org.mockito.junit.jupiter.MockitoSettings;
+import org.mockito.quality.Strictness;
+import org.mockito.stubbing.Answer;
+
+import java.sql.Timestamp;
+import java.time.LocalDateTime;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
+import java.util.Optional;
+import java.util.stream.Collectors;
+import java.util.stream.IntStream;
+
+import static org.apache.shenyu.common.constant.Constants.SYS_DEFAULT_NAMESPACE_ID;
+import static org.hamcrest.MatcherAssert.assertThat;
+import static org.hamcrest.Matchers.greaterThan;
+import static org.junit.Assert.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.BDDMockito.given;
+import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.mockStatic;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
+import static org.mockito.Mockito.when;
+
+/**
+ * Test cases for RuleService.
+ */
+@ExtendWith(MockitoExtension.class)
+@MockitoSettings(strictness = Strictness.LENIENT)
+public final class RuleServiceTest {
+
+    @Mock
+    private ShenyuDictMapper shenyuDictMapper;
+
+    @InjectMocks
+    private RuleServiceImpl ruleService;
+
+    @Mock
+    private RuleMapper ruleMapper;
+
+    @Mock
+    private RuleConditionMapper ruleConditionMapper;
+
+    @Mock
+    private SelectorMapper selectorMapper;
+
+    @Mock
+    private PluginMapper pluginMapper;
+    
+    @Mock
+    private DataPermissionMapper dataPermissionMapper;
+    
+    @Mock
+    private RuleEventPublisher ruleEventPublisher;
+
+    @Mock
+    private DataPermissionChecker dataPermissionChecker;
+
+    @Mock
+    private PluginDataPermissionChecker pluginDataPermissionChecker;
+
+    @BeforeEach
+    public void setUp() {
+        when(dataPermissionMapper.listByUserId("1")).thenReturn(Collections.singletonList(DataPermissionDO.buildPermissionDO(new DataPermissionDTO())));
+        ruleService = new RuleServiceImpl(ruleMapper, ruleConditionMapper, selectorMapper, pluginMapper, ruleEventPublisher, shenyuDictMapper, dataPermissionChecker,
+                pluginDataPermissionChecker);
+    }
+
+    @Test
+    public void testRegister() {
+        publishEvent();
+        testRegisterCreate();
+        testRegisterUpdate();
+    }
+
+    @Test
+    public void testCreateOrUpdate() {
+        publishEvent();
+        testUpdate();
+        testCreate();
+    }
+
+    @Test
+    public void testDelete() {
+        publishEvent();
+        RuleDO ruleDO = buildRuleDO("123");
+        final List<String> ids = Collections.singletonList(ruleDO.getId());
+        given(this.ruleMapper.selectByIdsAndNamespaceId(ids, SYS_DEFAULT_NAMESPACE_ID)).willReturn(Collections.singletonList(ruleDO));
+        given(this.ruleMapper.deleteByIdsAndNamespaceId(ids, SYS_DEFAULT_NAMESPACE_ID)).willReturn(ids.size());
+        assertEquals(this.ruleService.deleteByIdsAndNamespaceId(ids, SYS_DEFAULT_NAMESPACE_ID), ids.size());
+        verify(this.ruleConditionMapper).deleteByRuleIds(ids);
+    }
+
+    @Test
+    public void testWritesWithoutPluginDataPermissionAreRejectedBeforeWrite() {
+        final RuleDTO createDTO = buildRuleDTO(null);
+        final RuleDTO updateDTO = buildRuleDTO("123");
+        final List<String> ids = Collections.singletonList("123");
+        given(ruleMapper.selectByIdsAndNamespaceId(ids, SYS_DEFAULT_NAMESPACE_ID)).willReturn(Collections.singletonList(buildRuleDO("123")));
+        doThrow(new UnauthorizedException()).when(pluginDataPermissionChecker).checkCreateRule(createDTO);
+        doThrow(new UnauthorizedException()).when(pluginDataPermissionChecker).checkCreateRule(updateDTO);
+        doThrow(new UnauthorizedException()).when(pluginDataPermissionChecker).checkEnableRules(ids);
+        doThrow(new UnauthorizedException()).when(pluginDataPermissionChecker).checkDeleteRules(ids);
+
+        assertThrows(UnauthorizedException.class, () -> ruleService.createOrUpdate(createDTO));
+        assertThrows(UnauthorizedException.class, () -> ruleService.createOrUpdate(updateDTO));
+        assertThrows(UnauthorizedException.class, () -> ruleService.enabledByIdsAndNamespaceId(ids, false, SYS_DEFAULT_NAMESPACE_ID));
+        assertThrows(UnauthorizedException.class, () -> ruleService.deleteByIdsAndNamespaceId(ids, SYS_DEFAULT_NAMESPACE_ID));
+
+        verify(ruleMapper, never()).insertSelective(any());
+        verify(ruleMapper, never()).updateSelective(any());
+        verify(ruleMapper, never()).updateEnable(anyString(), any());
+        verify(ruleMapper, never()).deleteByIdsAndNamespaceId(any(), any());
+    }
+
+    @Test
+    public void testDeleteChecksOnlyTheRulesOfTheNamespace() {
+        final List<String> ids = Arrays.asList("123", "rule-of-other-namespace");
+        final List<String> namespaceRuleIds = Collections.singletonList("123");
+        given(ruleMapper.selectByIdsAndNamespaceId(ids, SYS_DEFAULT_NAMESPACE_ID)).willReturn(Collections.singletonList(buildRuleDO("123")));
+        given(ruleMapper.deleteByIdsAndNamespaceId(namespaceRuleIds, SYS_DEFAULT_NAMESPACE_ID)).willReturn(1);
+
+        assertEquals(1, ruleService.deleteByIdsAndNamespaceId(ids, SYS_DEFAULT_NAMESPACE_ID));
+
+        verify(pluginDataPermissionChecker).checkDeleteRules(namespaceRuleIds);
+    }
+
+    @Test
+    public void testDeleteForRegistrationSkipsPluginDataPermissionCheck() {
+        publishEvent();
+        final List<String> ids = Collections.singletonList("123");
+        given(ruleMapper.selectByIdsAndNamespaceId(ids, SYS_DEFAULT_NAMESPACE_ID)).willReturn(Collections.singletonList(buildRuleDO("123")));
+        given(ruleMapper.deleteByIdsAndNamespaceId(ids, SYS_DEFAULT_NAMESPACE_ID)).willReturn(1);
+
+        assertEquals(1, ruleService.deleteForRegistration(ids, SYS_DEFAULT_NAMESPACE_ID));
+
+        verify(ruleConditionMapper).deleteByRuleIds(ids);
+        verifyNoInteractions(pluginDataPermissionChecker);
+    }
+
+    @Test
+    public void testDeleteWithNoRulesInNamespace() {
+        final List<String> ids = Collections.singletonList("123");
+        given(this.ruleMapper.selectByIdsAndNamespaceId(ids, SYS_DEFAULT_NAMESPACE_ID)).willReturn(Collections.emptyList());
+
+        assertEquals(this.ruleService.deleteByIdsAndNamespaceId(ids, SYS_DEFAULT_NAMESPACE_ID), 0);
+        verify(this.ruleMapper, never()).deleteByIdsAndNamespaceId(ids, SYS_DEFAULT_NAMESPACE_ID);
+    }
+
+    @Test
+    public void testFindById() {
+        RuleDO ruleDO = buildRuleDO("123");
+        given(this.ruleMapper.selectNamespaceIdById("123")).willReturn(SYS_DEFAULT_NAMESPACE_ID);
+        given(this.ruleMapper.selectById("123")).willReturn(ruleDO);
+        RuleConditionQuery ruleConditionQuery = buildRuleConditionQuery();
+        RuleConditionDO ruleCondition = buildRuleConditionDO();
+        given(this.ruleConditionMapper.selectByQuery(ruleConditionQuery)).willReturn(Collections.singletonList(ruleCondition));
+        RuleVO ruleVO = buildRuleVO();
+        final RuleVO ruleVOById = this.ruleService.findById("123");
+        assertNotNull(ruleVOById);
+        assertEquals(ruleVOById.getId(), ruleVO.getId());
+    }
+
+    @Test
+    public void testFindByIdReturnsNullForUnknownIdentifier() {
+        given(this.ruleMapper.selectNamespaceIdById("missing")).willReturn(null);
+        assertNull(this.ruleService.findById("missing"));
+        verifyNoInteractions(dataPermissionChecker, ruleConditionMapper);
+        verify(this.ruleMapper, never()).selectById("missing");
+    }
+
+    @Test
+    public void testFindByIdDeniedDoesNotReadRuleConfiguration() {
+        given(this.ruleMapper.selectNamespaceIdById("denied")).willReturn(SYS_DEFAULT_NAMESPACE_ID);
+        doThrow(new UnauthorizedException("denied")).when(dataPermissionChecker)
+                .requireRuleReadable("denied", SYS_DEFAULT_NAMESPACE_ID);
+
+        assertThrows(UnauthorizedException.class, () -> this.ruleService.findById("denied"));
+        verify(dataPermissionChecker).requireRuleReadable("denied", SYS_DEFAULT_NAMESPACE_ID);
+        verifyNoInteractions(ruleConditionMapper);
+        verify(this.ruleMapper, never()).selectById("denied");
+    }
+
+    @Test
+    public void testListByPage() {
+        PageParameter parameter = new PageParameter();
+        parameter.setPageSize(5);
+        parameter.setTotalCount(10);
+        parameter.setTotalPage(parameter.getTotalCount() / parameter.getPageSize());
+        RuleQuery ruleQuery = new RuleQuery("456", null, parameter);
+        List<RuleDO> ruleDOList = IntStream.range(0, 10).mapToObj(i -> buildRuleDO(String.valueOf(i))).collect(Collectors.toList());
+        given(this.ruleMapper.selectByQuery(ruleQuery)).willReturn(ruleDOList);
+        final CommonPager<RuleVO> ruleVOCommonPager = this.ruleService.listByPage(ruleQuery);
+        assertEquals(ruleVOCommonPager.getDataList().size(), ruleDOList.size());
+    }
+
+    @Test
+    public void testListAll() {
+        publishEvent();
+        checkListAll(null);
+    }
+
+    @Test
+    public void testListAllData() {
+        publishEvent();
+        RuleConditionQuery ruleConditionQuery = buildRuleConditionQuery();
+        RuleConditionDO ruleCondition = buildRuleConditionDO();
+        given(this.ruleConditionMapper.selectByQuery(ruleConditionQuery)).willReturn(Collections.singletonList(ruleCondition));
+        RuleDO ruleDO = buildRuleDO("123");
+        List<RuleDO> ruleDOList = Collections.singletonList(ruleDO);
+        given(this.ruleMapper.selectAll()).willReturn(ruleDOList);
+        List<RuleVO> dataList = this.ruleService.listAllData();
+        assertNotNull(dataList);
+        assertEquals(ruleDOList.size(), dataList.size());
+    }
+
+    @Test
+    public void testImportData() {
+        final List<RuleDO> ruleDO = Collections.singletonList(buildRuleDO("123", "123"));
+        given(this.ruleMapper.selectAll()).willReturn(ruleDO);
+
+        final List<RuleDTO> ruleDTOS = Collections.singletonList(buildRuleDTO("123"));
+        given(this.ruleMapper.insertSelective(any())).willReturn(1);
+
+        given(this.selectorMapper.selectById("456")).willReturn(buildSelectorDO());
+        given(this.pluginMapper.selectById("789")).willReturn(buildPluginDO());
+
+        ConfigImportResult configImportResult = this.ruleService.importData(ruleDTOS);
+
+        assertNotNull(configImportResult);
+        assertEquals(configImportResult.getSuccessCount(), ruleDTOS.size());
+
+    }
+
+    @Test
+    public void testAgentGatewayCreateRejectsUnknownHandleFieldBeforeWrite() {
+        mockAgentGatewayPlugin();
+        RuleDTO ruleDTO = buildRuleDTO("");
+        ruleDTO.setHandle("{\"trafficType\":\"LLM\",\"unexpected\":true}");
+
+        assertThrows(ShenyuAdminException.class, () -> ruleService.createOrUpdate(ruleDTO));
+
+        verify(ruleMapper, never()).insertSelective(any());
+        verify(ruleEventPublisher, never()).onCreated(any(), any());
+    }
+
+    @Test
+    public void testAgentGatewayUpdateRejectsUnknownHandleFieldBeforeWrite() {
+        mockAgentGatewayPlugin();
+        RuleDTO ruleDTO = buildRuleDTO("123");
+        ruleDTO.setHandle("{\"trafficType\":\"LLM\",\"unexpected\":true}");
+
+        assertThrows(ShenyuAdminException.class, () -> ruleService.createOrUpdate(ruleDTO));
+
+        verify(ruleMapper, never()).updateSelective(any());
+        verify(ruleEventPublisher, never()).onUpdated(any(), any(), any(), any());
+    }
+
+    @Test
+    public void testAgentGatewayMcpRejectsNestedUnknownFieldBeforeWrite() {
+        mockAgentGatewayPlugin();
+        RuleDTO ruleDTO = buildRuleDTO("");
+        ruleDTO.setHandle("{\"trafficType\":\"mcp\",\"mcp\":{\"future\":true}}");
+        assertThrows(ShenyuAdminException.class, () -> ruleService.createOrUpdate(ruleDTO));
+        verify(ruleMapper, never()).insertSelective(any());
+        verify(ruleEventPublisher, never()).onCreated(any(), any());
+    }
+
+    @Test
+    public void testAgentGatewayMcpAcceptsExplicitConfiguration() {
+        mockAgentGatewayPlugin();
+        RuleDTO ruleDTO = buildRuleDTO("");
+        ruleDTO.setHandle("{\"trafficType\":\"mcp\",\"mcp\":{\"allowedTools\":[\"read\"]}}");
+        given(ruleMapper.insertSelective(any())).willReturn(1);
+        assertEquals(1, ruleService.createOrUpdate(ruleDTO));
+        verify(ruleEventPublisher).onCreated(any(), any());
+    }
+
+    @Test
+    public void testAgentGatewayCreateAcceptsValidHandle() {
+        mockAgentGatewayPlugin();
+        RuleDTO ruleDTO = buildRuleDTO("");
+        ruleDTO.setHandle("{\"trafficType\":\"LLM\",\"responseRequestId\":true}");
+        given(ruleMapper.insertSelective(any())).willReturn(1);
+
+        assertEquals(1, ruleService.createOrUpdate(ruleDTO));
+        verify(ruleEventPublisher).onCreated(any(), any());
+    }
+
+    @Test
+    public void testAgentGatewayImportRejectsUnknownHandleFieldBeforeWrite() {
+        mockAgentGatewayPlugin();
+        given(ruleMapper.selectAll()).willReturn(Collections.emptyList());
+        RuleDTO ruleDTO = buildRuleDTO("");
+        ruleDTO.setHandle("{\"trafficType\":\"LLM\",\"unexpected\":true}");
+
+        assertThrows(ShenyuAdminException.class, () -> ruleService.importData(Collections.singletonList(ruleDTO)));
+        verify(ruleMapper, never()).insertSelective(any());
+    }
+
+    @Test
+    public void testAgentGatewayNamespaceImportValidatesMappedSelectorBeforeWrite() {
+        mockAgentGatewayPlugin();
+        given(ruleMapper.selectAllByNamespaceId(SYS_DEFAULT_NAMESPACE_ID)).willReturn(Collections.emptyList());
+        ConfigsImportContext context = new ConfigsImportContext();
+        context.getSelectorIdMapping().put("source-selector", "456");
+        RuleDTO ruleDTO = buildRuleDTO("");
+        ruleDTO.setSelectorId("source-selector");
+        ruleDTO.setHandle("{\"trafficType\":\"LLM\",\"unexpected\":true}");
+
+        assertThrows(ShenyuAdminException.class, () -> ruleService.importData(
+                SYS_DEFAULT_NAMESPACE_ID, Collections.singletonList(ruleDTO), context));
+        verify(ruleMapper, never()).insertSelective(any());
+    }
+
+    @Test
+    public void testImportRejectsRuleWhenSelectorIsMissing() {
+        given(ruleMapper.selectAll()).willReturn(Collections.emptyList());
+
+        assertThrows(ShenyuAdminException.class, () -> ruleService.importData(
+                Collections.singletonList(buildRuleDTO(""))));
+
+        verify(ruleMapper, never()).insertSelective(any());
+    }
+
+    @Test
+    public void testImportRejectsRuleWhenPluginIsMissing() {
+        given(ruleMapper.selectAll()).willReturn(Collections.emptyList());
+        given(selectorMapper.selectById("456")).willReturn(buildSelectorDO());
+
+        assertThrows(ShenyuAdminException.class, () -> ruleService.importData(
+                Collections.singletonList(buildRuleDTO(""))));
+
+        verify(ruleMapper, never()).insertSelective(any());
+    }
+
+    @Test
+    public void testRewriteCreateRejectsUnapplicableHandleBeforeWrite() {
+        mockRewritePlugin();
+        RuleDTO ruleDTO = buildRuleDTO("");
+        ruleDTO.setHandle("{\"regex\":\"test\",\"replace\":\"/v1/$$\"}");
+
+        assertThrows(ShenyuAdminException.class, () -> ruleService.createOrUpdate(ruleDTO));
+
+        verify(ruleMapper, never()).insertSelective(any());
+        verify(ruleEventPublisher, never()).onCreated(any(), any());
+    }
+
+    @Test
+    public void testRewriteUpdateRejectsUnapplicableHandleBeforeWrite() {
+        mockRewritePlugin();
+        RuleDTO ruleDTO = buildRuleDTO("123");
+        ruleDTO.setHandle("{\"regex\":\"test\",\"replace\":\"/new/$\"}");
+
+        assertThrows(ShenyuAdminException.class, () -> ruleService.createOrUpdate(ruleDTO));
+
+        verify(ruleMapper, never()).updateSelective(any());
+        verify(ruleEventPublisher, never()).onUpdated(any(), any(), any(), any());
+    }
+
+    @Test
+    public void testRewriteCreateAcceptsApplicableHandle() {
+        mockRewritePlugin();
+        RuleDTO ruleDTO = buildRuleDTO("");
+        ruleDTO.setHandle("{\"regex\":\"(test)\",\"replace\":\"/new/$1\"}");
+        given(ruleMapper.insertSelective(any())).willReturn(1);
+
+        assertEquals(1, ruleService.createOrUpdate(ruleDTO));
+        verify(ruleEventPublisher).onCreated(any(), any());
+    }
+
+    @Test
+    public void testRewriteImportRejectsUnapplicableHandleBeforeWrite() {
+        mockRewritePlugin();
+        given(ruleMapper.selectAll()).willReturn(Collections.emptyList());
+        RuleDTO ruleDTO = buildRuleDTO("");
+        ruleDTO.setHandle("{\"regex\":\"test\",\"replace\":\"/new/$x\"}");
+
+        assertThrows(ShenyuAdminException.class, () -> ruleService.importData(Collections.singletonList(ruleDTO)));
+        verify(ruleMapper, never()).insertSelective(any());
+    }
+
+    private void mockRewritePlugin() {
+        given(selectorMapper.selectById("456")).willReturn(buildSelectorDO());
+        given(pluginMapper.selectById("789")).willReturn(PluginDO.builder()
+                .id("789")
+                .name(PluginEnum.REWRITE.getName())
+                .build());
+    }
+
+    private void mockAgentGatewayPlugin() {
+        given(selectorMapper.selectById("456")).willReturn(buildSelectorDO());
+        given(pluginMapper.selectById("789")).willReturn(PluginDO.builder()
+                .id("789")
+                .name(PluginEnum.AGENT_GATEWAY.getName())
+                .build());
+    }
+
+    @Test
+    public void testListAllWithSelectorNull() {
+        mockFindSelectorIsNull();
+        checkListAll(0);
+    }
+
+    private void mockFindSelectorIsNull() {
+        given(this.selectorMapper.selectById("456")).willReturn(null);
+        given(this.pluginMapper.selectById("789")).willReturn(buildPluginDO());
+    }
+
+    @Test
+    public void testListAllWithPluginNull() {
+        mockFindPluginIsNull();
+        checkListAll(0);
+    }
+
+    private void mockFindPluginIsNull() {
+        given(this.selectorMapper.selectById("456")).willReturn(buildSelectorDO());
+        given(this.pluginMapper.selectById("789")).willReturn(null);
+    }
+
+    private void checkListAll(final Integer expected) {
+        RuleConditionQuery ruleConditionQuery = buildRuleConditionQuery();
+        RuleConditionDO ruleCondition = buildRuleConditionDO();
+        given(this.ruleConditionMapper.selectByQuery(ruleConditionQuery)).willReturn(Collections.singletonList(ruleCondition));
+        RuleDO ruleDO = buildRuleDO("123");
+        List<RuleDO> ruleDOList = Collections.singletonList(ruleDO);
+        given(this.ruleMapper.selectAll()).willReturn(ruleDOList);
+        List<RuleData> dataList = this.ruleService.listAll();
+        assertNotNull(dataList);
+        assertEquals(Optional.ofNullable(expected).orElse(ruleDOList.size()), dataList.size());
+    }
+
+    @Test
+    public void testFindBySelectorId() {
+        publishEvent();
+        RuleConditionQuery ruleConditionQuery = buildRuleConditionQuery();
+        RuleConditionDO ruleCondition = buildRuleConditionDO();
+        given(this.ruleConditionMapper.selectByQuery(ruleConditionQuery)).willReturn(Collections.singletonList(ruleCondition));
+        RuleDO ruleDO = buildRuleDO("123");
+        List<RuleDO> ruleDOList = Collections.singletonList(ruleDO);
+        given(this.ruleMapper.findBySelectorId("456")).willReturn(ruleDOList);
+        List<RuleData> dataList = this.ruleService.findBySelectorId("456");
+        assertNotNull(dataList);
+        assertEquals(ruleDOList.size(), dataList.size());
+    }
+
+    @Test
+    public void testFindBySelectorIdList() {
+        publishEvent();
+        RuleConditionQuery ruleConditionQuery = buildRuleConditionQuery();
+        RuleConditionDO ruleCondition = buildRuleConditionDO();
+        given(this.ruleConditionMapper.selectByQuery(ruleConditionQuery)).willReturn(Collections.singletonList(ruleCondition));
+        RuleDO ruleDO = buildRuleDO("123");
+        List<RuleDO> ruleDOList = Collections.singletonList(ruleDO);
+        given(this.ruleMapper.findBySelectorIds(Collections.singletonList("456"))).willReturn(ruleDOList);
+        List<RuleData> dataList = this.ruleService.findBySelectorIdList(Collections.singletonList("456"));
+        assertNotNull(dataList);
+        assertEquals(ruleDOList.size(), dataList.size());
+    }
+
+    @Test
+    public void testSearchByPage() {
+        testSelectorMergeScenario(
+                null,
+                Arrays.asList(buildSelectorDO()),
+                1,
+                Collections.singletonList(buildSelectorDO().getId())
+        );
+
+        SelectorDO selectorDO1 = SelectorDO.builder().id("s1").build();
+        SelectorDO selectorDO2 = SelectorDO.builder().id("s2").build();
+        testSelectorMergeScenario(
+                new ArrayList<>(Arrays.asList("s1", "s3")),
+                Arrays.asList(selectorDO1, selectorDO2),
+                2,
+                Arrays.asList("s1", "s3")
+        );
+
+        testSelectorMergeScenario(
+                new ArrayList<>(Arrays.asList("s1", "s2")),
+                Collections.emptyList(),
+                2,
+                Arrays.asList("s1", "s2")
+        );
+
+        testSelectorMergeScenario(
+                new ArrayList<>(Arrays.asList("s1", "s2")),
+                null,
+                2,
+                Arrays.asList("s1", "s2")
+        );
+
+        testSearchByPageWithSpecifiedSelectors();
+        testSearchByPageExpandsNamespaceSelectorsWhenSelectorsEmpty();
+    }
+
+    private void testSearchByPageWithSpecifiedSelectors() {
+        Page<RuleDO> emptyPage = new Page<>();
+        PageCondition<RuleQueryCondition> pageCondition = buildPageCondition();
+        RuleQueryCondition condition = pageCondition.getCondition();
+        List<String> userSelectors = new ArrayList<>(Arrays.asList("s1", "s3"));
+        SelectorDO selectorDO1 = SelectorDO.builder().id("s1").build();
+        SelectorDO selectorDO2 = SelectorDO.builder().id("s2").build();
+        condition.setSelectors(userSelectors);
+
+        given(this.selectorMapper.selectAllByNamespaceId(anyString())).willReturn(Arrays.asList(selectorDO1, selectorDO2));
+        given(this.ruleMapper.selectByCondition(any(RuleQueryCondition.class))).willReturn(emptyPage);
+
+        PageInfo<RuleVO> result = ruleService.searchByPage(pageCondition);
+
+        assertNotNull(result);
+        assertEquals(2, condition.getSelectors().size());
+        assertTrue(condition.getSelectors().containsAll(Arrays.asList("s1", "s3")));
+    }
+
+    private void testSearchByPageExpandsNamespaceSelectorsWhenSelectorsEmpty() {
+        Page<RuleDO> emptyPage = new Page<>();
+        PageCondition<RuleQueryCondition> pageCondition = buildPageCondition();
+        RuleQueryCondition condition = pageCondition.getCondition();
+        SelectorDO selectorDO1 = SelectorDO.builder().id("s1").build();
+        SelectorDO selectorDO2 = SelectorDO.builder().id("s2").build();
+        condition.setSelectors(Collections.emptyList());
+
+        given(this.selectorMapper.selectAllByNamespaceId(anyString())).willReturn(Arrays.asList(selectorDO1, selectorDO2));
+        given(this.ruleMapper.selectByCondition(any(RuleQueryCondition.class))).willReturn(emptyPage);
+
+        PageInfo<RuleVO> result = ruleService.searchByPage(pageCondition);
+
+        assertNotNull(result);
+        assertEquals(2, condition.getSelectors().size());
+        assertTrue(condition.getSelectors().containsAll(Arrays.asList("s1", "s2")));
+    }
+
+    private void testSelectorMergeScenario(final List<String> userSelectors,
+                                           final List<SelectorDO> namespaceSelectorDOs,
+                                           final int expectedSize,
+                                           final List<String> expectedContains) {
+        Page<RuleDO> emptyPage = new Page<>();
+        // 1. 构建分页条件
+        PageCondition<RuleQueryCondition> pageCondition = buildPageCondition();
+        RuleQueryCondition condition = pageCondition.getCondition();
+        condition.setSelectors(userSelectors);
+
+        // 2. Mock依赖行为
+        given(this.selectorMapper.selectAllByNamespaceId(anyString())).willReturn(namespaceSelectorDOs);
+        given(this.ruleMapper.selectByCondition(any(RuleQueryCondition.class))).willReturn(emptyPage);
+
+        // 3. 执行测试方法
+        PageInfo<RuleVO> result = ruleService.searchByPage(pageCondition);
+
+        // 4. 统一验证
+        assertNotNull(result);
+        List<String> finalSelectors = condition.getSelectors();
+        assertEquals(expectedSize, finalSelectors.size());
+        assertTrue(finalSelectors.containsAll(expectedContains));
+    }
+
+
+    private PageCondition<RuleQueryCondition> buildPageCondition() {
+        RuleQueryCondition condition = new RuleQueryCondition();
+        condition.setNamespaceId("test-namespace");
+        PageCondition<RuleQueryCondition> pageCondition = new PageCondition<>();
+        pageCondition.setCondition(condition);
+        pageCondition.setPageNum(1);
+        pageCondition.setPageSize(10);
+        return pageCondition;
+    }
+
+    private void publishEvent() {
+        PluginDO pluginDO = buildPluginDO();
+        SelectorDO selectorDO = buildSelectorDO();
+        given(this.selectorMapper.selectById("456")).willReturn(selectorDO);
+        given(this.pluginMapper.selectById("789")).willReturn(pluginDO);
+        given(this.selectorMapper.selectByIdSet(Sets.newHashSet("456"))).willReturn(Collections.singletonList(selectorDO));
+        given(this.pluginMapper.selectByIds(Lists.newArrayList("789"))).willReturn(Collections.singletonList(pluginDO));
+        given(this.ruleConditionMapper.selectByRuleIdSet(Sets.newHashSet("123"))).willReturn(Collections.singletonList(buildRuleConditionDO()));
+    }
+
+    @Test
+    public void testCreateRejectsOverlappingCanaryLabelsBeforeSaving() {
+        configureDivideSelector();
+        RuleDTO dto = buildRuleDTO("");
+        dto.setHandle("{\"canary\":{\"enabled\":false,\"canaryLabels\":{\"release\":\"canary\"},\"stableLabels\":{\"region\":\"east\"}}}");
+        assertThrows(ShenyuAdminException.class, () -> ruleService.createOrUpdate(dto));
+        verify(ruleMapper, never()).insertSelective(any());
+    }
+
+    @Test
+    public void testUpdateRejectsOverlappingCanaryLabelsBeforeSaving() {
+        configureDivideSelector();
+        RuleDTO dto = buildRuleDTO("123");
+        dto.setHandle("{\"canary\":{\"canaryLabels\":{\"release\":\"canary\"},\"stableLabels\":{\"release\":\"canary\"}}}");
+        given(ruleMapper.selectById("123")).willReturn(buildRuleDO("123"));
+        assertThrows(ShenyuAdminException.class, () -> ruleService.createOrUpdate(dto));
+        verify(ruleMapper, never()).updateSelective(any());
+    }
+
+    @Test
+    public void testUpdateRejectsMovingRuleToSelectorOfAnotherPlugin() {
+        publishEvent();
+        RuleDTO dto = buildRuleDTO("123");
+        dto.setSelectorId("target-selector");
+        given(ruleMapper.selectById("123")).willReturn(buildRuleDO("123"));
+        given(selectorMapper.selectById("target-selector")).willReturn(SelectorDO.builder().id("target-selector").pluginId("other-plugin").build());
+        given(pluginMapper.selectById("other-plugin")).willReturn(PluginDO.builder().id("other-plugin").name("other").build());
+        ShenyuAdminException exception = assertThrows(ShenyuAdminException.class, () -> ruleService.createOrUpdate(dto));
+        assertEquals("a rule cannot be moved to a selector of another plugin", exception.getMessage());
+        verify(ruleMapper, never()).updateSelective(any());
+    }
+
+    @Test
+    public void testUpdateRejectsBlankSelectorIdAsMissingSelector() {
+        publishEvent();
+        RuleDTO dto = buildRuleDTO("123");
+        dto.setSelectorId("");
+        given(ruleMapper.selectById("123")).willReturn(buildRuleDO("123"));
+        ShenyuAdminException exception = assertThrows(ShenyuAdminException.class, () -> ruleService.createOrUpdate(dto));
+        assertEquals("rule selector is not found", exception.getMessage());
+        verify(ruleMapper, never()).updateSelective(any());
+    }
+
+    @Test
+    public void testUpdateAllowsMovingRuleToSelectorOfSamePlugin() {
+        publishEvent();
+        RuleDTO dto = buildRuleDTO("123");
+        dto.setSelectorId("target-selector");
+        given(ruleMapper.selectById("123")).willReturn(buildRuleDO("123"));
+        given(selectorMapper.selectById("target-selector")).willReturn(SelectorDO.builder().id("target-selector").pluginId("789").build());
+        given(ruleMapper.updateSelective(any())).willReturn(1);
+        assertEquals(1, ruleService.createOrUpdate(dto));
+        ArgumentCaptor<RuleDO> captor = ArgumentCaptor.forClass(RuleDO.class);
+        verify(ruleMapper).updateSelective(captor.capture());
+        assertEquals("target-selector", captor.getValue().getSelectorId());
+    }
+
+    @Test
+    public void testUpdateWithUnchangedSelectorSkipsSelectorPluginComparison() {
+        publishEvent();
+        RuleDTO dto = buildRuleDTO("123");
+        given(ruleMapper.selectById("123")).willReturn(buildRuleDO("123"));
+        given(ruleMapper.updateSelective(any())).willReturn(1);
+        assertEquals(1, ruleService.createOrUpdate(dto));
+        // one lookup each from validateRuleHandle and validateCanaryConfig; the plugin comparison adds none
+        verify(selectorMapper, times(2)).selectById("456");
+        verify(ruleMapper).updateSelective(any());
+    }
+
+    @Test
+    public void testSaveAllowsDisabledCanaryWithDisjointPools() {
+        configureDivideSelector();
+        RuleDTO dto = buildRuleDTO("");
+        dto.setHandle("{\"canary\":{\"enabled\":false,\"canaryLabels\":{\"release\":\"canary\"},\"stableLabels\":{\"release\":\"stable\"}}}");
+        given(ruleMapper.insertSelective(any())).willReturn(1);
+        try (MockedStatic<JwtUtils> jwt = mockStatic(JwtUtils.class)) {
+            jwt.when(JwtUtils::getUserInfo).thenReturn(UserInfo.builder().userId("1").userName("admin").build());
+            assertEquals(1, ruleService.createOrUpdate(dto));
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"{\"percentage\":101}", "{\"percentage\":20.5}", "{\"matchMode\":2}",
+        "{\"enabled\":true,\"percentage\":20}", "{\"stableLabels\":{\"release\":true}}", "{\"fallbackPolicy\":\"TYPO\"}",
+        "{\"stickyKey\":{\"paramType\":\"unregistered\"}}",
+        "{\"conditions\":[{\"paramType\":\"uri\",\"operator\":\"unregistered\",\"paramValue\":\"/\"}]}"})
+    public void testInvalidCanaryNeverWritesOrPublishes(final String patch) {
+        configureDivideSelector();
+        given(shenyuDictMapper.findByType("paramType")).willReturn(Collections.singletonList(dictionary("uri", true)));
+        RuleDTO dto = buildRuleDTO("");
+        dto.setHandle(canaryHandle(patch));
+        assertThrows(ShenyuAdminException.class, () -> ruleService.createOrUpdate(dto));
+        dto.setId("123");
+        given(ruleMapper.selectById("123")).willReturn(buildRuleDO("123"));
+        assertThrows(ShenyuAdminException.class, () -> ruleService.createOrUpdate(dto));
+        verify(ruleMapper, never()).insertSelective(any());
+        verify(ruleMapper, never()).updateSelective(any());
+        verifyNoInteractions(ruleConditionMapper, ruleEventPublisher);
+    }
+
+    @Test
+    public void testImportsValidateAllRulesBeforeInserting() {
+        configureDivideSelector();
+        RuleDTO valid = buildRuleDTO("");
+        valid.setHandle(canaryHandle("{}"));
+        RuleDTO invalid = buildRuleDTO("");
+        invalid.setHandle(canaryHandle("{\"percentage\":101}"));
+        List<RuleDTO> rules = Arrays.asList(valid, invalid);
+        assertThrows(ShenyuAdminException.class, () -> ruleService.importData(rules));
+        ConfigsImportContext context = new ConfigsImportContext();
+        context.getSelectorIdMapping().put("456", "456");
+        assertThrows(ShenyuAdminException.class, () -> ruleService.importData(SYS_DEFAULT_NAMESPACE_ID, rules, context));
+        verify(ruleMapper, never()).insertSelective(any());
+        verifyNoInteractions(ruleConditionMapper, ruleEventPublisher);
+    }
+
+    @Test
+    public void testRegistrationRejectsInvalidCanaryBeforePublishing() {
+        configureDivideSelector();
+        RuleDTO dto = buildRuleDTO("");
+        dto.setHandle(canaryHandle("{\"percentage\":101}"));
+        assertThrows(ShenyuAdminException.class, () -> ruleService.registerDefault(dto));
+        verify(ruleMapper, never()).insertSelective(any());
+        verifyNoInteractions(ruleConditionMapper, ruleEventPublisher);
+    }
+
+    @Test
+    public void testEnabledDictionaryExtensionIsAcceptedAndDisabledOneRejected() {
+        configureDivideSelector();
+        RuleDTO dto = buildRuleDTO("");
+        dto.setHandle(canaryHandle("{\"enabled\":true,\"percentage\":20,\"stickyKey\":{\"paramType\":\"custom-source\"}}"));
+        given(shenyuDictMapper.findByType("paramType")).willReturn(Collections.singletonList(dictionary("custom-source", false)));
+        assertThrows(ShenyuAdminException.class, () -> ruleService.createOrUpdate(dto));
+        verifyNoInteractions(ruleEventPublisher);
+        given(shenyuDictMapper.findByType("paramType")).willReturn(Collections.singletonList(dictionary("custom-source", true)));
+        given(ruleMapper.insertSelective(any())).willReturn(1);
+        try (MockedStatic<JwtUtils> jwt = mockStatic(JwtUtils.class)) {
+            jwt.when(JwtUtils::getUserInfo).thenReturn(UserInfo.builder().userId("1").userName("admin").build());
+            assertEquals(1, ruleService.createOrUpdate(dto));
+        }
+    }
+
+    @Test
+    public void testSavingLegacyRulePreservesHandleWithoutCanary() {
+        configureDivideSelector();
+        RuleDTO dto = buildRuleDTO("123");
+        dto.setHandle("{\"timeout\":5000,\"extension\":{\"value\":true}}");
+        given(ruleMapper.selectById("123")).willReturn(buildRuleDO("123"));
+        given(ruleMapper.updateSelective(any())).willReturn(1);
+        assertEquals(1, ruleService.createOrUpdate(dto));
+        ArgumentCaptor<RuleDO> saved = ArgumentCaptor.forClass(RuleDO.class);
+        verify(ruleMapper).updateSelective(saved.capture());
+        assertEquals(dto.getHandle(), saved.getValue().getHandle());
+        verifyNoInteractions(shenyuDictMapper);
+    }
+
+    @Test
+    public void testCanaryFailoverNeverWritesOrPublishes() {
+        configureDivideSelector();
+        JsonObject handle = JsonParser.parseString(canaryHandle("{}")).getAsJsonObject();
+        handle.addProperty("retry", 2);
+        handle.addProperty("retryStrategy", "failover");
+        RuleDTO dto = buildRuleDTO("");
+        dto.setHandle(handle.toString());
+        assertThrows(ShenyuAdminException.class, () -> ruleService.createOrUpdate(dto));
+        assertThrows(ShenyuAdminException.class, () -> ruleService.registerDefault(dto));
+        dto.setId("123");
+        given(ruleMapper.selectById("123")).willReturn(buildRuleDO("123"));
+        assertThrows(ShenyuAdminException.class, () -> ruleService.createOrUpdate(dto));
+        assertThrows(ShenyuAdminException.class, () -> ruleService.importData(Collections.singletonList(dto)));
+        verify(ruleMapper, never()).insertSelective(any());
+        verify(ruleMapper, never()).updateSelective(any());
+        verifyNoInteractions(ruleConditionMapper, ruleEventPublisher);
+    }
+
+    /**
+     * A sticky section that cannot work at runtime must be rejected before the rule is
+     * written or published (#8037).
+     */
+    @ParameterizedTest
+    @ValueSource(strings = {"{\"enabled\":true,\"secrets\":[\"secret\"],\"onUnavailable\":\"strict\"}",
+        "{\"enabled\":true,\"secrets\":[\"secret\"],\"maxAgeSeconds\":0}",
+        "{\"enabled\":true,\"secrets\":[]}",
+        "{\"enabled\":true,\"secrets\":[\"secret\"],\"cookieName\":\" \"}",
+        "{\"enabled\":true,\"secrets\":[\"secret\"],\"cookieName\":null}",
+        "{\"enabled\":true,\"secrets\":[\"secret\"],\"key\":{}}",
+        "{\"enabled\":true,\"secrets\":[\"secret\"],\"key\":{\"name\":\"X\",\"type\":\"cookie\"}}",
+        "{\"enabled\":true,\"secrets\":\"s\"}",
+        "{\"enabled\":true,\"maxAgeSeconds\":1.5}"})
+    public void testInvalidStickyNeverWritesOrPublishes(final String stickyPatch) {
+        configureDivideSelector();
+        RuleDTO dto = buildRuleDTO("");
+        dto.setHandle(stickyHandle(stickyPatch));
+        assertThrows(ShenyuAdminException.class, () -> ruleService.createOrUpdate(dto));
+        dto.setId("123");
+        given(ruleMapper.selectById("123")).willReturn(buildRuleDO("123"));
+        assertThrows(ShenyuAdminException.class, () -> ruleService.createOrUpdate(dto));
+        assertThrows(ShenyuAdminException.class, () -> ruleService.registerDefault(dto));
+        assertThrows(ShenyuAdminException.class, () -> ruleService.importData(Collections.singletonList(dto)));
+        ConfigsImportContext context = new ConfigsImportContext();
+        context.getSelectorIdMapping().put("456", "456");
+        assertThrows(ShenyuAdminException.class,
+                () -> ruleService.importData(SYS_DEFAULT_NAMESPACE_ID, Collections.singletonList(dto), context));
+        verify(ruleMapper, never()).insertSelective(any());
+        verify(ruleMapper, never()).updateSelective(any());
+        verifyNoInteractions(ruleConditionMapper, ruleEventPublisher);
+    }
+
+    @Test
+    public void testStickyErrorsNameTheField() {
+        assertStickyError("{\"enabled\":true,\"secrets\":\"s\"}", "sticky.secrets must be an array");
+        assertStickyError("{\"enabled\":true,\"secrets\":[\"secret\"],\"cookieName\":null}",
+                "sticky.cookieName must not be blank; omit it to use the default");
+        assertStickyError("{\"enabled\":true,\"secrets\":[\"secret\"],\"key\":{\"name\":\"X\",\"type\":\"cookie\"}}",
+                "sticky.key.type must be HEADER or COOKIE, got: cookie");
+    }
+
+    private void assertStickyError(final String stickyPatch, final String message) {
+        configureDivideSelector();
+        RuleDTO dto = buildRuleDTO("");
+        dto.setHandle(stickyHandle(stickyPatch));
+        ShenyuAdminException exception = assertThrows(ShenyuAdminException.class,
+                () -> ruleService.createOrUpdate(dto));
+        assertEquals(message, exception.getMessage());
+    }
+
+    /**
+     * A valid sticky section is stored unchanged, so the management plane accepts what the
+     * runtime can execute (#8037).
+     */
+    @Test
+    public void testValidStickyIsSavedUnchanged() {
+        configureDivideSelector();
+        RuleDTO dto = buildRuleDTO("");
+        dto.setHandle(stickyHandle("{\"enabled\":true,\"secrets\":[\"secret\"],\"onUnavailable\":\"STRICT\"}"));
+        given(ruleMapper.insertSelective(any())).willReturn(1);
+        try (MockedStatic<JwtUtils> jwt = mockStatic(JwtUtils.class)) {
+            jwt.when(JwtUtils::getUserInfo).thenReturn(UserInfo.builder().userId("1").userName("admin").build());
+            assertEquals(1, ruleService.createOrUpdate(dto));
+        }
+        ArgumentCaptor<RuleDO> saved = ArgumentCaptor.forClass(RuleDO.class);
+        verify(ruleMapper).insertSelective(saved.capture());
+        assertEquals(dto.getHandle(), saved.getValue().getHandle());
+    }
+
+    /**
+     * A disabled sticky section is inert at runtime, so it must not block the write of an
+     * unrelated rule change (#8037).
+     */
+    @Test
+    public void testDisabledStickyIsNotRejected() {
+        configureDivideSelector();
+        RuleDTO dto = buildRuleDTO("");
+        dto.setHandle(stickyHandle("{\"enabled\":false,\"maxAgeSeconds\":0,\"onUnavailable\":\"strict\"}"));
+        given(ruleMapper.insertSelective(any())).willReturn(1);
+        try (MockedStatic<JwtUtils> jwt = mockStatic(JwtUtils.class)) {
+            jwt.when(JwtUtils::getUserInfo).thenReturn(UserInfo.builder().userId("1").userName("admin").build());
+            assertEquals(1, ruleService.createOrUpdate(dto));
+        }
+    }
+
+    private ShenyuDictDO dictionary(final String value, final boolean enabled) {
+        ShenyuDictDO dict = new ShenyuDictDO();
+        dict.setDictValue(value);
+        dict.setEnabled(enabled);
+        return dict;
+    }
+
+    private String canaryHandle(final String patch) {
+        JsonObject config = JsonParser.parseString("{\"stableLabels\":{\"release\":\"stable\"},\"canaryLabels\":{\"release\":\"canary\"}}")
+                .getAsJsonObject();
+        JsonParser.parseString(patch).getAsJsonObject().entrySet().forEach(entry -> config.add(entry.getKey(), entry.getValue()));
+        JsonObject handle = new JsonObject();
+        handle.add("canary", config);
+        return handle.toString();
+    }
+
+    private String stickyHandle(final String patch) {
+        JsonObject handle = new JsonObject();
+        handle.addProperty("timeout", 5000);
+        handle.add("sticky", JsonParser.parseString(patch));
+        return handle.toString();
+    }
+
+    private void configureDivideSelector() {
+        given(selectorMapper.selectById("456")).willReturn(buildSelectorDO());
+        given(pluginMapper.selectById("789")).willReturn(PluginDO.builder().id("789").name("divide").build());
+    }
+
+    private void testRegisterCreate() {
+        RuleDTO ruleDTO = buildRuleDTO("");
+        RuleDO ruleDO = RuleDO.buildRuleDO(ruleDTO);
+        String ruleId = this.ruleService.registerDefault(ruleDTO);
+        assertNotNull(ruleId);
+        assertEquals(ruleId.length(), ruleDO.getId().length());
+    }
+
+    private void testRegisterUpdate() {
+        RuleDTO ruleDTO = buildRuleDTO("123");
+        String ruleId = this.ruleService.registerDefault(ruleDTO);
+        assertNotNull(ruleId);
+        assertEquals(ruleId, ruleDTO.getId());
+    }
+
+    private void testCreate() {
+        try (MockedStatic<JwtUtils> mocked = mockStatic(JwtUtils.class)) {
+            mocked.when(JwtUtils::getUserInfo)
+                    .thenAnswer((Answer<UserInfo>) invocation -> UserInfo.builder().userId("1").userName("admin").build());
+            RuleDTO ruleDTO = buildRuleDTO("");
+            given(this.ruleMapper.insertSelective(any())).willReturn(1);
+            assertThat(this.ruleService.createOrUpdate(ruleDTO), greaterThan(0));
+        }
+    }
+
+    private void testUpdate() {
+        RuleDTO ruleDTO = buildRuleDTO("123");
+        given(this.ruleMapper.selectById("123")).willReturn(buildRuleDO("123"));
+        given(this.ruleMapper.updateSelective(any())).willReturn(1);
+        assertThat(this.ruleService.createOrUpdate(ruleDTO), greaterThan(0));
+    }
+
+    private RuleDO buildRuleDO(final String id) {
+        RuleDTO ruleDTO = RuleDTO.builder()
+                .selectorId("456")
+                .matchMode(0)
+                .handle("{\"test1\":\"\"}")
+                .name("456")
+                .build();
+        if (StringUtils.isNotBlank(id)) {
+            ruleDTO.setId(id);
+        }
+        RuleConditionDTO ruleConditionDTO1 = RuleConditionDTO.builder().id("111").build();
+        RuleConditionDTO ruleConditionDTO2 = RuleConditionDTO.builder().id("222").build();
+        ruleDTO.setRuleConditions(Arrays.asList(ruleConditionDTO1, ruleConditionDTO2));
+        RuleDO ruleDO = RuleDO.buildRuleDO(ruleDTO);
+        Timestamp now = Timestamp.valueOf(LocalDateTime.now());
+        ruleDO.setDateCreated(now);
+        ruleDO.setDateUpdated(now);
+        return ruleDO;
+    }
+
+    private RuleDO buildRuleDO(final String id, final String name) {
+        RuleDTO ruleDTO = RuleDTO.builder()
+                .selectorId("456")
+                .matchMode(0)
+                .handle("{\"test1\":\"\"}")
+                .name(name)
+                .build();
+        if (StringUtils.isNotBlank(id)) {
+            ruleDTO.setId(id);
+        }
+        RuleConditionDTO ruleConditionDTO1 = RuleConditionDTO.builder().id("111").build();
+        RuleConditionDTO ruleConditionDTO2 = RuleConditionDTO.builder().id("222").build();
+        ruleDTO.setRuleConditions(Arrays.asList(ruleConditionDTO1, ruleConditionDTO2));
+        RuleDO ruleDO = RuleDO.buildRuleDO(ruleDTO);
+        Timestamp now = Timestamp.valueOf(LocalDateTime.now());
+        ruleDO.setDateCreated(now);
+        ruleDO.setDateUpdated(now);
+        return ruleDO;
+    }
+
+    private RuleDTO buildRuleDTO(final String id) {
+        RuleDTO ruleDTO = RuleDTO.builder()
+                .selectorId("456")
+                .matchMode(0)
+                .handle("{\"test1\":\"\"}")
+                .name("456")
+                .namespaceId(SYS_DEFAULT_NAMESPACE_ID)
+                .build();
+        if (StringUtils.isNotBlank(id)) {
+            ruleDTO.setId(id);
+        }
+        RuleConditionDTO ruleConditionDTO1 = RuleConditionDTO.builder().id("111").build();
+        RuleConditionDTO ruleConditionDTO2 = RuleConditionDTO.builder().id("222").build();
+        RuleConditionDTO ruleConditionDTO3 = RuleConditionDTO.builder().ruleId("333").build();
+        ruleDTO.setRuleConditions(Arrays.asList(ruleConditionDTO1, ruleConditionDTO2, ruleConditionDTO3));
+        return ruleDTO;
+    }
+
+    private RuleVO buildRuleVO() {
+        RuleVO ruleVO = new RuleVO();
+        ruleVO.setId("123");
+        return ruleVO;
+    }
+
+    private PluginDO buildPluginDO() {
+        return PluginDO.builder()
+                .name("test")
+                .id("789")
+                .build();
+    }
+
+    private SelectorDO buildSelectorDO() {
+        return SelectorDO.builder()
+                .pluginId("789")
+                .id("456")
+                .build();
+    }
+
+    private RuleConditionDO buildRuleConditionDO() {
+        Timestamp now = Timestamp.valueOf(LocalDateTime.now());
+        return RuleConditionDO.builder()
+                .ruleId("123")
+                .paramType("post")
+                .operator("match")
+                .dateCreated(now)
+                .dateUpdated(now)
+                .build();
+    }
+
+    private RuleConditionQuery buildRuleConditionQuery() {
+        RuleConditionQuery ruleConditionQuery = new RuleConditionQuery();
+        ruleConditionQuery.setRuleId("123");
+        return ruleConditionQuery;
+    }
+
+    @Test
+    public void enabledByIdsAndNamespaceIdSkipsForeignRules() {
+        RuleDO own = new RuleDO();
+        own.setId("rule-own");
+        own.setNamespaceId("ns-a");
+        RuleDO foreign = new RuleDO();
+        foreign.setId("rule-foreign");
+        foreign.setNamespaceId("ns-b");
+        when(ruleMapper.selectById("rule-own")).thenReturn(own);
+        when(ruleMapper.selectById("rule-foreign")).thenReturn(foreign);
+        when(ruleMapper.updateEnable(anyString(), any())).thenReturn(1);
+        when(ruleConditionMapper.selectByQuery(any())).thenReturn(Collections.emptyList());
+
+        ruleService.enabledByIdsAndNamespaceId(Arrays.asList("rule-own", "rule-foreign"), false, "ns-a");
+
+        verify(ruleMapper).updateEnable("rule-own", false);
+        verify(ruleMapper, never()).updateEnable("rule-foreign", false);
+    }
+
+    @Test
+    public void updateWithForeignNamespaceLeavesRuleUntouched() {
+        final RuleDO before = new RuleDO();
+        before.setSelectorId("sel-1");
+        before.setNamespaceId("foreign");
+        when(ruleMapper.selectById("rule-1")).thenReturn(before);
+        when(ruleMapper.updateSelective(any())).thenReturn(0);
+
+        final RuleDTO dto = new RuleDTO();
+        dto.setId("rule-1");
+        dto.setSelectorId("sel-1");
+        final SelectorDO selectorDO = new SelectorDO();
+        selectorDO.setPluginId("plugin-1");
+        when(selectorMapper.selectById("sel-1")).thenReturn(selectorDO);
+        final PluginDO pluginDO = new PluginDO();
+        pluginDO.setName("divide");
+        when(pluginMapper.selectById("plugin-1")).thenReturn(pluginDO);
+        dto.setRuleConditions(Collections.singletonList(RuleConditionDTO.builder()
+                .ruleId("rule-1").operator("=").paramName("path").paramType("uri").paramValue("/x").build()));
+
+        final int count = ruleService.update(dto);
+
+        assertEquals(0, count);
+        verify(ruleConditionMapper, never()).deleteByQuery(any());
+        verify(ruleEventPublisher, never()).onUpdated(any(), any(), any(), any());
+    }
+
+}

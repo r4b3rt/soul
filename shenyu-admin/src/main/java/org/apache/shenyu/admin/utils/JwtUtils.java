@@ -1,0 +1,166 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.shenyu.admin.utils;
+
+import com.auth0.jwt.JWT;
+import com.auth0.jwt.JWTCreator;
+import com.auth0.jwt.JWTVerifier;
+import com.auth0.jwt.algorithms.Algorithm;
+import com.auth0.jwt.exceptions.JWTCreationException;
+import com.auth0.jwt.exceptions.JWTVerificationException;
+import com.auth0.jwt.interfaces.DecodedJWT;
+import org.apache.shenyu.admin.model.custom.UserInfo;
+import org.apache.shiro.SecurityUtils;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.Date;
+import java.util.Optional;
+
+/**
+ * JWT tools.
+ */
+public final class JwtUtils {
+
+    /**
+     * Claim carrying the token version the token was issued for.
+     */
+    public static final String TOKEN_VERSION_CLAIM = "tokenVersion";
+
+    /**
+     * Version reported for tokens issued before token versioning existed.
+     */
+    public static final long LEGACY_TOKEN_VERSION = 0L;
+
+    private static final Logger LOG = LoggerFactory.getLogger(JwtUtils.class);
+
+    private static final long TOKEN_EXPIRE_SECONDS = 24 * 60 * 60 * 1000L;
+
+    private JwtUtils() {
+    }
+
+    /**
+     * according to token to get isUserInfo.
+     *
+     * @return UserInfo {@link UserInfo}
+     */
+    public static UserInfo getUserInfo() {
+        return (UserInfo) SecurityUtils.getSubject().getPrincipal();
+    }
+
+    /**
+     * according to token to get issuer.
+     *
+     * @param token token
+     * @return Issuer {@link String}
+     */
+    public static String getIssuer(final String token) {
+        DecodedJWT jwt = JWT.decode(token);
+        return Optional.of(jwt).map(item -> item.getClaim("userName").asString()).orElse("");
+    }
+
+    /**
+     * according to token to get clientId.
+     *
+     * @param token token
+     * @return ClientId {@link String}
+     */
+    public static String getClientId(final String token) {
+        DecodedJWT jwt = JWT.decode(token);
+        return Optional.of(jwt).map(item -> item.getClaim("clientId").asString()).orElse("");
+    }
+
+    /**
+     * according to token to get the token version it was issued for.
+     *
+     * <p>Tokens issued before token versioning have no version claim and are
+     * reported as {@link #LEGACY_TOKEN_VERSION}.</p>
+     *
+     * @param token token
+     * @return token version
+     */
+    public static long getTokenVersion(final String token) {
+        DecodedJWT jwt = JWT.decode(token);
+        return Optional.ofNullable(jwt.getClaim(TOKEN_VERSION_CLAIM))
+                .map(claim -> claim.asLong())
+                .orElse(LEGACY_TOKEN_VERSION);
+    }
+
+    /**
+     * generate jwt token.
+     *
+     * @param userName login's userName
+     * @param key      secretKey
+     * @param clientId clientId
+     * @return token
+     */
+    public static String generateToken(final String userName, final String key, final String clientId) {
+        return generateToken(userName, key, clientId, null);
+    }
+
+    /**
+     * generate jwt token.
+     *
+     * @param userName      login's userName
+     * @param key           secretKey
+     * @param clientId      clientId
+     * @param expireSeconds expireSeconds
+     * @return token
+     */
+    public static String generateToken(final String userName, final String key, final String clientId, final Long expireSeconds) {
+        return generateToken(userName, key, clientId, null, expireSeconds);
+    }
+
+    /**
+     * generate jwt token bound to a user token version.
+     *
+     * @param userName      login's userName
+     * @param key           secretKey
+     * @param clientId      clientId
+     * @param tokenVersion  the user's current token version, or null to omit the claim
+     * @param expireSeconds expireSeconds
+     * @return token
+     */
+    public static String generateToken(final String userName, final String key, final String clientId,
+                                       final Long tokenVersion, final Long expireSeconds) {
+        try {
+            JWTCreator.Builder builder = JWT.create()
+                    .withClaim("userName", userName)
+                    .withClaim("clientId", clientId)
+                    .withExpiresAt(new Date(System.currentTimeMillis() + Optional.ofNullable(expireSeconds).orElse(TOKEN_EXPIRE_SECONDS)));
+            if (Optional.ofNullable(tokenVersion).isPresent()) {
+                builder.withClaim(TOKEN_VERSION_CLAIM, tokenVersion);
+            }
+            return builder.sign(Algorithm.HMAC256(key));
+        } catch (IllegalArgumentException | JWTCreationException e) {
+            LOG.error("JWTToken generate fail ", e);
+        }
+        return "";
+    }
+
+    public static boolean verifyToken(final String token, final String key) {
+        try {
+            JWTVerifier verifier = JWT.require(Algorithm.HMAC256(key)).build();
+            verifier.verify(token);
+            return true;
+        } catch (JWTVerificationException e) {
+            LOG.error("jwt decode fail, token: {} ", token, e);
+        }
+        return false;
+    }
+}

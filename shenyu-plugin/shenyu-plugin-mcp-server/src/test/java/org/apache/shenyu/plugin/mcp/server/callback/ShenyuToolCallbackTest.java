@@ -1,0 +1,493 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.shenyu.plugin.mcp.server.callback;
+
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
+import io.modelcontextprotocol.common.McpTransportContext;
+import io.modelcontextprotocol.server.McpSyncServerExchange;
+import org.apache.shenyu.common.constant.Constants;
+import org.apache.shenyu.common.enums.RpcTypeEnum;
+import org.apache.shenyu.plugin.api.ShenyuPluginChain;
+import org.apache.shenyu.plugin.api.context.ShenyuContext;
+import org.apache.shenyu.plugin.mcp.server.definition.ShenyuToolDefinition;
+import org.apache.shenyu.plugin.mcp.server.holder.ShenyuMcpExchangeHolder;
+import org.apache.shenyu.plugin.mcp.server.session.McpSessionHelper;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.Mock;
+import org.mockito.MockedStatic;
+import org.mockito.Mockito;
+import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.ai.chat.model.ToolContext;
+import org.springframework.core.io.buffer.DataBuffer;
+import org.springframework.core.io.buffer.DataBufferUtils;
+import org.springframework.http.MediaType;
+import org.springframework.http.server.reactive.ServerHttpRequest;
+import org.springframework.mock.http.server.reactive.MockServerHttpRequest;
+import org.springframework.mock.web.server.MockServerWebExchange;
+import org.springframework.test.util.ReflectionTestUtils;
+import org.springframework.web.server.ServerWebExchange;
+import reactor.core.publisher.Mono;
+
+import java.net.URI;
+import java.nio.charset.StandardCharsets;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
+
+/**
+ * Test case for {@link ShenyuToolCallback}.
+ */
+@ExtendWith(MockitoExtension.class)
+class ShenyuToolCallbackTest {
+
+    @Mock
+    private ShenyuToolDefinition toolDefinition;
+
+    @Mock
+    private ServerWebExchange exchange;
+
+    @Mock
+    private ShenyuPluginChain chain;
+
+    @Mock
+    private ServerHttpRequest request;
+
+    @Mock
+    private ShenyuContext shenyuContext;
+
+    @Mock
+    private McpSyncServerExchange mcpSyncServerExchange;
+
+    private ShenyuToolCallback shenyuToolCallback;
+
+    private MockedStatic<McpSessionHelper> mcpSessionHelperMock;
+
+    private MockedStatic<ShenyuMcpExchangeHolder> exchangeHolderMock;
+
+    @BeforeEach
+    void setUp() {
+        // Minimal setup - individual tests will add specific mocks as needed
+        mcpSessionHelperMock = Mockito.mockStatic(McpSessionHelper.class);
+        exchangeHolderMock = Mockito.mockStatic(ShenyuMcpExchangeHolder.class);
+    }
+
+    @AfterEach
+    void tearDown() {
+        mcpSessionHelperMock.close();
+        exchangeHolderMock.close();
+    }
+
+    @Test
+    void testGetToolDefinition() {
+        shenyuToolCallback = new ShenyuToolCallback(toolDefinition);
+        
+        assertEquals(toolDefinition, shenyuToolCallback.getToolDefinition());
+    }
+
+    @Test
+    void testCallWithNullInput() {
+        shenyuToolCallback = new ShenyuToolCallback(toolDefinition);
+        
+        assertThrows(NullPointerException.class, () -> {
+            shenyuToolCallback.call(null);
+        });
+    }
+
+    @Test
+    void testCallWithNullToolContext() {
+        shenyuToolCallback = new ShenyuToolCallback(toolDefinition);
+        
+        assertThrows(NullPointerException.class, () -> {
+            shenyuToolCallback.call("{}", null);
+        });
+    }
+
+    @Test
+    void testCallWithInvalidInput() {
+        when(toolDefinition.name()).thenReturn("testTool");
+        shenyuToolCallback = new ShenyuToolCallback(toolDefinition);
+        
+        ToolContext toolContext = new ToolContext(new HashMap<>());
+        
+        assertThrows(RuntimeException.class, () -> {
+            shenyuToolCallback.call("invalid json", toolContext);
+        });
+    }
+
+    @Test
+    void testCallWithMissingMcpExchange() {
+        when(toolDefinition.name()).thenReturn("testTool");
+        shenyuToolCallback = new ShenyuToolCallback(toolDefinition);
+        
+        ToolContext toolContext = new ToolContext(new HashMap<>());
+        mcpSessionHelperMock.when(() -> McpSessionHelper.getMcpSyncServerExchange(any()))
+                .thenReturn(null);
+        
+        assertThrows(RuntimeException.class, () -> {
+            shenyuToolCallback.call("{}", toolContext);
+        });
+    }
+
+    @Test
+    void testCallWithMissingSessionId() throws Exception {
+        when(toolDefinition.name()).thenReturn("testTool");
+        shenyuToolCallback = new ShenyuToolCallback(toolDefinition);
+        
+        ToolContext toolContext = new ToolContext(new HashMap<>());
+        mcpSessionHelperMock.when(() -> McpSessionHelper.getMcpSyncServerExchange(any()))
+                .thenReturn(mcpSyncServerExchange);
+        mcpSessionHelperMock.when(() -> McpSessionHelper.getSessionId(any()))
+                .thenReturn("");
+
+        final RuntimeException exception = assertThrows(RuntimeException.class, () -> {
+            shenyuToolCallback.call("{}", toolContext);
+        });
+
+        assertEquals("Tool execution failed: Session ID is empty – it should have been set earlier by handleMessageEndpoint",
+                exception.getMessage());
+        assertInstanceOf(IllegalStateException.class, exception.getCause());
+        assertFalse(exception.getMessage().contains("SDK compatibility"));
+    }
+
+    @Test
+    void testCallWithMissingExchange() throws Exception {
+        when(toolDefinition.name()).thenReturn("testTool");
+        when(toolDefinition.requestConfig()).thenReturn(
+                "{\"requestTemplate\":{\"url\":\"/test\",\"method\":\"GET\"},\"argsPosition\":{}}"
+        );
+        shenyuToolCallback = new ShenyuToolCallback(toolDefinition);
+        
+        final ToolContext toolContext = new ToolContext(new HashMap<>());
+        mcpSessionHelperMock.when(() -> McpSessionHelper.getMcpSyncServerExchange(any()))
+                .thenReturn(mcpSyncServerExchange);
+        mcpSessionHelperMock.when(() -> McpSessionHelper.getSessionId(any()))
+                .thenReturn("session123");
+        exchangeHolderMock.when(() -> ShenyuMcpExchangeHolder.get("session123"))
+                .thenReturn(null);
+        
+        assertThrows(RuntimeException.class, () -> {
+            shenyuToolCallback.call("{}", toolContext);
+        });
+    }
+
+    @Test
+    void testCallWithSdkCompatibilitySessionErrorAddsVersionContext() {
+        when(toolDefinition.name()).thenReturn("testTool");
+        shenyuToolCallback = new ShenyuToolCallback(toolDefinition);
+
+        final ToolContext toolContext = new ToolContext(new HashMap<>());
+        mcpSessionHelperMock.when(() -> McpSessionHelper.getMcpSyncServerExchange(any()))
+                .thenReturn(mcpSyncServerExchange);
+        mcpSessionHelperMock.when(() -> McpSessionHelper.getSessionId(any()))
+                .thenThrow(new IllegalStateException("SDK COMPATIBILITY ERROR: reflection access failed"));
+        mcpSessionHelperMock.when(McpSessionHelper::getSupportedSdkVersion)
+                .thenReturn("0.17.0");
+
+        final RuntimeException exception = assertThrows(RuntimeException.class, () -> {
+            shenyuToolCallback.call("{}", toolContext);
+        });
+
+        assertTrue(exception.getMessage().contains("Tool execution failed: Failed to extract session ID from MCP exchange."));
+        assertInstanceOf(IllegalStateException.class, exception.getCause());
+        assertTrue(exception.getCause().getMessage().contains("Tested SDK version: 0.17.0."));
+        assertTrue(exception.getCause().getMessage().contains("Original error: SDK COMPATIBILITY ERROR: reflection access failed"));
+    }
+
+    @Test
+    void testCallWithMissingSessionStateDoesNotWrapAsCompatibilityError() {
+        when(toolDefinition.name()).thenReturn("testTool");
+        shenyuToolCallback = new ShenyuToolCallback(toolDefinition);
+
+        final ToolContext toolContext = new ToolContext(new HashMap<>());
+        mcpSessionHelperMock.when(() -> McpSessionHelper.getMcpSyncServerExchange(any()))
+                .thenReturn(mcpSyncServerExchange);
+        mcpSessionHelperMock.when(() -> McpSessionHelper.getSessionId(any()))
+                .thenThrow(new IllegalArgumentException("Session is required in McpAsyncServerExchange"));
+
+        final RuntimeException exception = assertThrows(RuntimeException.class, () -> {
+            shenyuToolCallback.call("{}", toolContext);
+        });
+
+        assertEquals("Tool execution failed: Session is required in McpAsyncServerExchange", exception.getMessage());
+        assertInstanceOf(IllegalArgumentException.class, exception.getCause());
+        assertFalse(exception.getMessage().contains("SDK compatibility"));
+    }
+
+    @Test
+    void testCallWithValidSetup() throws Exception {
+        when(toolDefinition.name()).thenReturn("testTool");
+        when(toolDefinition.requestConfig()).thenReturn("{\"requestTemplate\":{\"url\":\"/test\",\"method\":\"GET\"},\"argsPosition\":{}}");
+        shenyuToolCallback = new ShenyuToolCallback(toolDefinition);
+        
+        final ToolContext toolContext = new ToolContext(new HashMap<>());
+        String sessionId = "session123";
+        
+        // Setup minimal mocks needed for the execution path
+        mcpSessionHelperMock.when(() -> McpSessionHelper.getMcpSyncServerExchange(any()))
+                .thenReturn(mcpSyncServerExchange);
+        mcpSessionHelperMock.when(() -> McpSessionHelper.getSessionId(any()))
+                .thenReturn(sessionId);
+        exchangeHolderMock.when(() -> ShenyuMcpExchangeHolder.get(sessionId))
+                .thenReturn(exchange);
+        
+        when(exchange.getAttribute(Constants.CHAIN)).thenReturn(chain);
+        
+        // This test may timeout or fail during execution - the exact failure doesn't matter
+        // We just want to test that it reaches the execution logic
+        assertThrows(RuntimeException.class, () -> {
+            shenyuToolCallback.call("{}", toolContext);
+        });
+    }
+
+    @Test
+    void testToolCallUsesHttpRpcType() {
+        shenyuToolCallback = new ShenyuToolCallback(toolDefinition);
+        when(exchange.getAttribute(Constants.CONTEXT)).thenReturn(shenyuContext);
+        when(exchange.getAttributes()).thenReturn(new HashMap<>());
+
+        ReflectionTestUtils.invokeMethod(shenyuToolCallback, "configureShenyuContext", exchange,
+                "session123", "/mcp/order/findAll",
+                "{\"requestTemplate\":{\"url\":\"/mcp/order/findAll\",\"method\":\"GET\"},\"argsPosition\":{}}");
+
+        verify(shenyuContext).setRpcType(RpcTypeEnum.HTTP.getName());
+    }
+
+    @Test
+    void testExecuteToolCallDisposesPluginChainOnTimeout() {
+        shenyuToolCallback = new ShenyuToolCallback(toolDefinition);
+
+        final String sessionId = "session123";
+        final MockServerWebExchange webExchange = MockServerWebExchange.from(
+                MockServerHttpRequest.get("http://localhost/original").build());
+        final AtomicBoolean cancelled = new AtomicBoolean();
+
+        when(chain.execute(any())).thenReturn(Mono.<Void>never().doOnCancel(() -> cancelled.set(true)));
+
+        final RuntimeException exception = assertThrows(RuntimeException.class,
+                () -> shenyuToolCallback.executeToolCall(webExchange, chain, sessionId,
+                        "{\"requestTemplate\":{\"url\":\"/test\",\"method\":\"GET\"},\"argsPosition\":{}}",
+                        "{}", 0));
+
+        assertTrue(exception.getMessage().contains("Tool execution timeout or error"));
+        assertTrue(cancelled.get());
+    }
+
+    @Test
+    void testConstructorWithNullToolDefinition() {
+        assertThrows(NullPointerException.class, () -> {
+            new ShenyuToolCallback(null);
+        });
+    }
+
+    @Test
+    void testRequestContextTakesPrecedenceOverSessionHolder() {
+        shenyuToolCallback = new ShenyuToolCallback(toolDefinition);
+        when(mcpSyncServerExchange.transportContext()).thenReturn(
+                McpTransportContext.create(Map.of(McpSessionHelper.SHENYU_EXCHANGE_CONTEXT_KEY, exchange)));
+        assertSame(exchange, ReflectionTestUtils.invokeMethod(shenyuToolCallback, "getOriginExchange", mcpSyncServerExchange, "shared-session"));
+        exchangeHolderMock.verifyNoInteractions();
+    }
+
+    @Test
+    void testLegacySessionHolderFallback() {
+        shenyuToolCallback = new ShenyuToolCallback(toolDefinition);
+        exchangeHolderMock.when(() -> ShenyuMcpExchangeHolder.get("legacy-session")).thenReturn(exchange);
+        assertSame(exchange, ReflectionTestUtils.invokeMethod(shenyuToolCallback, "getOriginExchange", mcpSyncServerExchange, "legacy-session"));
+        exchangeHolderMock.verify(() -> ShenyuMcpExchangeHolder.get("legacy-session"));
+    }
+
+    @Test
+    void testSetTargetUriUsesCompleteUrlAsIs() {
+        shenyuToolCallback = new ShenyuToolCallback(toolDefinition);
+        ServerHttpRequest.Builder builder = MockServerHttpRequest.get("http://gateway.example:9195/mcp").build().mutate();
+
+        ReflectionTestUtils.invokeMethod(shenyuToolCallback, "setTargetUri", builder, exchange, "https://target.example/api");
+
+        assertEquals(URI.create("https://target.example/api"), builder.build().getURI());
+    }
+
+    @Test
+    void testSetTargetUriPrefixesGatewayOriginForRelativePath() {
+        shenyuToolCallback = new ShenyuToolCallback(toolDefinition);
+        when(exchange.getRequest()).thenReturn(request);
+        when(request.getURI()).thenReturn(URI.create("http://gateway.example:9195/mcp"));
+        ServerHttpRequest.Builder builder = MockServerHttpRequest.get("http://gateway.example:9195/mcp").build().mutate();
+
+        ReflectionTestUtils.invokeMethod(shenyuToolCallback, "setTargetUri", builder, exchange, "/api/order");
+
+        assertEquals(URI.create("http://gateway.example:9195/api/order"), builder.build().getURI());
+    }
+
+    @Test
+    void testDecoratedExchangePreservesFixedAndDynamicQueryParameters() {
+        shenyuToolCallback = new ShenyuToolCallback(toolDefinition);
+        MockServerWebExchange originExchange = MockServerWebExchange.from(
+                MockServerHttpRequest.get("http://gateway.example:9195/mcp").build());
+        ShenyuContext context = new ShenyuContext();
+        originExchange.getAttributes().put(Constants.CONTEXT, context);
+        String config = "{\"requestTemplate\":{\"url\":\"/users?fixed=true\",\"method\":\"GET\"},"
+                + "\"argsPosition\":{\"page\":\"query\"}}";
+
+        ServerWebExchange decoratedExchange = ReflectionTestUtils.invokeMethod(shenyuToolCallback, "buildDecoratedExchange",
+                originExchange, new CompletableFuture<String>(), "session123", config, "{\"page\":\"1\"}");
+
+        assertEquals(URI.create("http://gateway.example:9195/users?page=1&fixed=true"), decoratedExchange.getRequest().getURI());
+        assertEquals("1", decoratedExchange.getRequest().getQueryParams().getFirst("page"));
+        assertEquals("true", decoratedExchange.getRequest().getQueryParams().getFirst("fixed"));
+        assertEquals("/users", context.getPath());
+        assertEquals("/users", context.getRealUrl());
+    }
+
+    @Test
+    void testUrlValuedArgumentsPreserveToolEndpointAndContext() {
+        shenyuToolCallback = new ShenyuToolCallback(toolDefinition);
+        for (String position : new String[]{"query", "body", "body.callback", "header"}) {
+            MockServerWebExchange originExchange = MockServerWebExchange.from(
+                    MockServerHttpRequest.get("http://gateway.example:9195/mcp").build());
+            ShenyuContext context = new ShenyuContext();
+            originExchange.getAttributes().put(Constants.CONTEXT, context);
+            String headerTemplate = "header".equals(position)
+                    ? ",\"headers\":[{\"key\":\"X-Callback-URL\",\"value\":\"{{.callbackUrl}}\"}]" : "";
+            String config = "{\"requestTemplate\":{\"url\":\"/search\",\"method\":\"POST\",\"argsToJsonBody\":true"
+                    + headerTemplate + "},\"argsPosition\":{\"callbackUrl\":\"" + position + "\"}}";
+            String input = "{\"callbackUrl\":\"https://callback.invalid/return\"}";
+
+            ServerWebExchange decoratedExchange = ReflectionTestUtils.invokeMethod(shenyuToolCallback, "buildDecoratedExchange",
+                    originExchange, new CompletableFuture<String>(), "session123", config, input);
+
+            assertEquals("/search", decoratedExchange.getRequest().getPath().value(), position);
+            assertEquals("/search", context.getPath(), position);
+            assertEquals("/search", context.getRealUrl(), position);
+            if ("query".equals(position)) {
+                assertEquals("https://callback.invalid/return",
+                        decoratedExchange.getRequest().getQueryParams().getFirst("callbackUrl"));
+            }
+            if ("header".equals(position)) {
+                assertEquals("https://callback.invalid/return",
+                        decoratedExchange.getRequest().getHeaders().getFirst("X-Callback-URL"));
+            }
+            if (position.startsWith("body")) {
+                DataBuffer buffer = DataBufferUtils.join(decoratedExchange.getRequest().getBody()).block();
+                assertNotNull(buffer);
+                try {
+                    JsonObject body = JsonParser.parseString(buffer.toString(StandardCharsets.UTF_8)).getAsJsonObject();
+                    String bodyKey = "body".equals(position) ? "callbackUrl" : "callback";
+                    assertEquals("https://callback.invalid/return", body.get(bodyKey).getAsString());
+                } finally {
+                    DataBufferUtils.release(buffer);
+                }
+            }
+        }
+    }
+
+    @Test
+    void testExplicitTargetMappingRoutesToCompleteUrl() {
+        shenyuToolCallback = new ShenyuToolCallback(toolDefinition);
+        MockServerWebExchange originExchange = MockServerWebExchange.from(
+                MockServerHttpRequest.get("http://gateway.example:9195/mcp").build());
+        ShenyuContext context = new ShenyuContext();
+        originExchange.getAttributes().put(Constants.CONTEXT, context);
+        String config = "{\"requestTemplate\":{\"url\":\"/search\",\"method\":\"GET\"},"
+                + "\"argsPosition\":{\"endpoint\":\"target\"}}";
+
+        ServerWebExchange decoratedExchange = ReflectionTestUtils.invokeMethod(shenyuToolCallback, "buildDecoratedExchange",
+                originExchange, new CompletableFuture<String>(), "session123", config,
+                "{\"endpoint\":\"https://target.example/api?fixed=1\"}");
+
+        assertEquals(URI.create("https://target.example/api?fixed=1"), decoratedExchange.getRequest().getURI());
+        assertEquals("/api", context.getPath());
+        assertEquals("/api", context.getRealUrl());
+    }
+
+    @Test
+    void testConstructorWithValidToolDefinition() {
+        ShenyuToolCallback callback = new ShenyuToolCallback(toolDefinition);
+        assertNotNull(callback);
+        assertEquals(toolDefinition, callback.getToolDefinition());
+    }
+
+    @Test
+    void testDecoratedExchangeEncodesFormBody() {
+        final ShenyuToolCallback callback = new ShenyuToolCallback(toolDefinition);
+        final MockServerWebExchange originExchange = MockServerWebExchange.from(
+                MockServerHttpRequest.get("http://gateway.example:9195/mcp").build());
+        final String config = "{\"requestTemplate\":{\"url\":\"/submit\",\"method\":\"POST\","
+                + "\"headers\":[{\"key\":\"Content-Type\",\"value\":\"application/x-www-form-urlencoded\"}],"
+                + "\"argsToJsonBody\":true},\"argsPosition\":{\"name\":\"body\"}}";
+
+        final ServerWebExchange decoratedExchange = ReflectionTestUtils.invokeMethod(
+                callback, "buildDecoratedExchange", originExchange,
+                new CompletableFuture<String>(), "session123", config,
+                "{\"name\":\"Ada & Bob\"}");
+
+        assertNotNull(decoratedExchange);
+        final DataBuffer buffer = DataBufferUtils.join(
+                decoratedExchange.getRequest().getBody()).block();
+        assertNotNull(buffer);
+        try {
+            assertEquals("name=Ada+%26+Bob", buffer.toString(StandardCharsets.UTF_8));
+        } finally {
+            DataBufferUtils.release(buffer);
+        }
+
+        assertTrue(MediaType.APPLICATION_FORM_URLENCODED.isCompatibleWith(
+                decoratedExchange.getRequest().getHeaders().getContentType()));
+    }
+
+    @Test
+    void testDecoratedExchangeDefaultsToJsonWithoutTemplateContentType() {
+        final ShenyuToolCallback callback = new ShenyuToolCallback(toolDefinition);
+        final MockServerWebExchange originExchange = MockServerWebExchange.from(
+                MockServerHttpRequest.post("http://gateway.example:9195/mcp")
+                        .contentType(MediaType.APPLICATION_FORM_URLENCODED).build());
+        final String config = "{\"requestTemplate\":{\"url\":\"/submit\",\"method\":\"POST\","
+                + "\"argsToJsonBody\":true},\"argsPosition\":{\"name\":\"body\"}}";
+
+        final ServerWebExchange decoratedExchange = ReflectionTestUtils.invokeMethod(
+                callback, "buildDecoratedExchange", originExchange,
+                new CompletableFuture<String>(), "session123", config,
+                "{\"name\":\"Ada & Bob\"}");
+
+        assertNotNull(decoratedExchange);
+        assertEquals(MediaType.APPLICATION_JSON, decoratedExchange.getRequest().getHeaders().getContentType());
+        final DataBuffer buffer = DataBufferUtils.join(decoratedExchange.getRequest().getBody()).block();
+        assertNotNull(buffer);
+        try {
+            final JsonObject body = JsonParser.parseString(buffer.toString(StandardCharsets.UTF_8)).getAsJsonObject();
+            assertEquals("Ada & Bob", body.get("name").getAsString());
+        } finally {
+            DataBufferUtils.release(buffer);
+        }
+    }
+}

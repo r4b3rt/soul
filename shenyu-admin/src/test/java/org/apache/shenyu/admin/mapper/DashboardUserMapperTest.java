@@ -1,0 +1,232 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.shenyu.admin.mapper;
+
+import org.apache.shenyu.admin.AbstractSpringIntegrationTest;
+import org.apache.shenyu.admin.model.entity.DashboardUserDO;
+import org.apache.shenyu.admin.model.page.PageParameter;
+import org.apache.shenyu.admin.model.query.DashboardUserQuery;
+import org.apache.shenyu.common.utils.DigestUtils;
+import org.apache.shenyu.common.utils.UUIDUtils;
+import org.junit.jupiter.api.Test;
+
+import jakarta.annotation.Resource;
+import java.sql.Timestamp;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+
+import static org.hamcrest.MatcherAssert.assertThat;
+import static org.hamcrest.Matchers.comparesEqualTo;
+import static org.hamcrest.Matchers.greaterThan;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+
+/**
+ * test case for DashboardUserMapper.
+ */
+public final class DashboardUserMapperTest extends AbstractSpringIntegrationTest {
+
+    @Resource
+    private DashboardUserMapper dashboardUserMapper;
+
+    @Test
+    public void testInsert() {
+        DashboardUserDO record = buildDashboardUserDO();
+        int count = dashboardUserMapper.insert(record);
+        assertThat(count, comparesEqualTo(1));
+
+        int delete = dashboardUserMapper.delete(record.getId());
+        assertEquals(1, delete);
+    }
+
+    @Test
+    public void testInsertSelective() {
+        DashboardUserDO record = buildDashboardUserDO();
+        int count = dashboardUserMapper.insertSelective(record);
+        assertThat(count, comparesEqualTo(1));
+
+        int delete = dashboardUserMapper.delete(record.getId());
+        assertEquals(1, delete);
+    }
+
+    @Test
+    public void testSelectById() {
+        DashboardUserDO record = buildDashboardUserDO();
+        int count = dashboardUserMapper.insert(record);
+        assertThat(count, comparesEqualTo(1));
+        DashboardUserDO result = dashboardUserMapper.selectById(record.getId());
+        assertNotNull(result);
+
+        int delete = dashboardUserMapper.delete(record.getId());
+        assertEquals(1, delete);
+    }
+
+    @Test
+    public void testSelectByQuery() {
+        DashboardUserDO record = buildDashboardUserDO();
+        int count = dashboardUserMapper.insert(record);
+        assertThat(count, comparesEqualTo(1));
+
+        DashboardUserQuery query = new DashboardUserQuery();
+        PageParameter pageParameter = new PageParameter();
+        query.setUserName("adminTest");
+        query.setPageParameter(pageParameter);
+        List<DashboardUserDO> result = dashboardUserMapper.selectByQuery(query);
+        assertThat(result.size(), greaterThan(0));
+
+        int delete = dashboardUserMapper.delete(record.getId());
+        assertEquals(1, delete);
+    }
+
+    @Test
+    public void testCountByQuery() {
+        DashboardUserDO record = buildDashboardUserDO();
+        int count = dashboardUserMapper.insert(record);
+        assertThat(count, comparesEqualTo(1));
+
+        DashboardUserQuery query = new DashboardUserQuery();
+        query.setUserName("adminTest");
+        int result = dashboardUserMapper.countByQuery(query);
+        assertThat(result, greaterThan(0));
+
+        int delete = dashboardUserMapper.delete(record.getId());
+        assertEquals(1, delete);
+    }
+
+    @Test
+    public void testUpdate() {
+        DashboardUserDO record = buildDashboardUserDO();
+        int count = dashboardUserMapper.insert(record);
+        assertThat(count, comparesEqualTo(1));
+
+        record.setUserName("adminUpdate");
+        int result = dashboardUserMapper.update(record);
+        assertThat(result, comparesEqualTo(1));
+
+        int delete = dashboardUserMapper.delete(record.getId());
+        assertEquals(1, delete);
+    }
+
+    @Test
+    public void testUpdateSelective() {
+        DashboardUserDO record = buildDashboardUserDO();
+        int count = dashboardUserMapper.insert(record);
+        assertThat(count, comparesEqualTo(1));
+
+        record.setUserName("adminUpdate");
+        int result = dashboardUserMapper.updateSelective(record);
+        assertThat(result, comparesEqualTo(1));
+
+        int delete = dashboardUserMapper.delete(record.getId());
+        assertEquals(1, delete);
+    }
+
+    @Test
+    public void testTokenVersionRoundTrip() {
+        DashboardUserDO record = buildDashboardUserDO();
+        int count = dashboardUserMapper.insertSelective(record);
+        assertThat(count, comparesEqualTo(1));
+
+        // a newly created account starts at the legacy version
+        assertEquals(0L, dashboardUserMapper.selectById(record.getId()).getTokenVersion());
+
+        DashboardUserDO update = DashboardUserDO.builder()
+                .id(record.getId())
+                .tokenVersion(2L)
+                .build();
+        int result = dashboardUserMapper.updateSelective(update);
+        assertThat(result, comparesEqualTo(1));
+        assertEquals(2L, dashboardUserMapper.selectById(record.getId()).getTokenVersion());
+
+        int delete = dashboardUserMapper.delete(record.getId());
+        assertEquals(1, delete);
+    }
+
+    @Test
+    public void testIncrementTokenVersion() {
+        DashboardUserDO record = buildDashboardUserDO();
+        assertThat(dashboardUserMapper.insertSelective(record), comparesEqualTo(1));
+
+        Timestamp now = new Timestamp(System.currentTimeMillis());
+        assertEquals(1, dashboardUserMapper.incrementTokenVersion(record.getId(), now));
+        assertEquals(1, dashboardUserMapper.incrementTokenVersion(record.getId(), now));
+        assertEquals(2L, dashboardUserMapper.selectById(record.getId()).getTokenVersion());
+
+        assertEquals(1, dashboardUserMapper.delete(record.getId()));
+    }
+
+    @Test
+    public void testConcurrentIncrementsAreAtomic() throws Exception {
+        DashboardUserDO record = buildDashboardUserDO();
+        assertThat(dashboardUserMapper.insertSelective(record), comparesEqualTo(1));
+
+        final int threads = 8;
+        final int incrementsPerThread = 5;
+        ExecutorService pool = Executors.newFixedThreadPool(threads);
+        CountDownLatch start = new CountDownLatch(1);
+        List<Future<?>> futures = new ArrayList<>();
+        for (int i = 0; i < threads; i++) {
+            futures.add(pool.submit(() -> {
+                start.await();
+                for (int j = 0; j < incrementsPerThread; j++) {
+                    dashboardUserMapper.incrementTokenVersion(record.getId(), new Timestamp(System.currentTimeMillis()));
+                }
+                return null;
+            }));
+        }
+        start.countDown();
+        for (Future<?> future : futures) {
+            future.get(30, TimeUnit.SECONDS);
+        }
+        pool.shutdown();
+        // every increment must land: a lost update here would silently revive a revoked token
+        assertEquals((long) threads * incrementsPerThread,
+                dashboardUserMapper.selectById(record.getId()).getTokenVersion());
+
+        assertEquals(1, dashboardUserMapper.delete(record.getId()));
+    }
+
+    @Test
+    public void testDelete() {
+        DashboardUserDO record = buildDashboardUserDO();
+        int count = dashboardUserMapper.insert(record);
+        assertThat(count, comparesEqualTo(1));
+
+        int result = dashboardUserMapper.delete(record.getId());
+        assertThat(result, comparesEqualTo(1));
+    }
+
+    private DashboardUserDO buildDashboardUserDO() {
+
+        Timestamp now = new Timestamp(System.currentTimeMillis());
+        return DashboardUserDO.builder()
+                .id(UUIDUtils.getInstance().generateShortUuid())
+                .userName("adminTest")
+                .password(DigestUtils.sha512Hex("123456"))
+                .enabled(true)
+                .role(1)
+                .dateCreated(now)
+                .dateUpdated(now)
+                .build();
+    }
+}
